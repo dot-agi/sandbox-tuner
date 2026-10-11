@@ -1,0 +1,14 @@
+{
+  "name": "sandbox-tuner",
+  "owner": { "name": "dot-agi" },
+  "description": "Sandbox Tuner, a Claude Code mod that turns recurring sandbox blocks into reviewed, undoable settings edits.",
+  "plugins": [
+    {
+      "name": "sandbox-tuner",
+      "source": "./",
+      "description": "Explains each Claude Code sandbox block in plain words and turns recurring blocks into reviewed, one-press, undoable edits of your user settings.",
+      "category": "security",
+      "tags": ["mod", "sandbox", "settings", "security"]
+    }
+  ]
+}
