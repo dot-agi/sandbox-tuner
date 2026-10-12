@@ -83,6 +83,43 @@ To try it for one session from a clone:
 claude --plugin-dir ./sandbox-tuner
 ```
 
+### Agents and scripts
+
+Install from a shell with Claude Code 2.1.292 or later. The second part turns on auto-update. It runs only when the install succeeds and the marketplace entry exists:
+
+```sh
+claude plugin install sandbox-tuner --marketplace dot-agi/sandbox-tuner --scope user --json \
+  && f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+  && jq -e --arg name sandbox-tuner '.extraKnownMarketplaces[$name].source' "$f" > /dev/null \
+  && tmp=$(mktemp "$f.XXXXXX") \
+  && { jq --arg name sandbox-tuner '.extraKnownMarketplaces[$name].autoUpdate = true' "$f" > "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; false; }; }
+```
+
+Claude Code 2.1.288 to 2.1.291 has no `--marketplace` option. Add the marketplace first, then run the auto-update part above:
+
+```sh
+claude plugin marketplace add dot-agi/sandbox-tuner --scope user --json \
+  && claude plugin install sandbox-tuner@sandbox-tuner --scope user --json
+```
+
+Auto-update runs only in interactive sessions. A headless job updates at its start, before the session that uses the mod:
+
+```sh
+claude plugin update sandbox-tuner@sandbox-tuner --json
+```
+
+Check the result. The first command prints the installed version. The second prints the latest release:
+
+```sh
+claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tuner") | "\(.version) enabled=\(.enabled)"' \
+  && git ls-remote --tags --refs https://github.com/dot-agi/sandbox-tuner 'sandbox-tuner--v*' | sed 's/.*--v//' | sort -V | tail -n 1
+```
+
+- On a host with no SSH key for GitHub, set `CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1` in the environment of every `claude` command and session.
+- New code loads in the next session, or after `/reload-plugins`. An agent cannot type `/reload-plugins`, so it starts a new session.
+- Running `install` again does not update. Use `update`.
+- The `mv` replaces the settings file, with mode 600. If `settings.json` is a symbolic link, edit its target instead.
+
 ## Commands
 
 | Command | What it does |
