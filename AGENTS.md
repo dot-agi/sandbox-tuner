@@ -43,14 +43,14 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 
 | Path | Content |
 | --- | --- |
-| `.claude-plugin/plugin.json` | The manifest, the `types` contract, and the `minimumSightings` option. |
+| `.claude-plugin/plugin.json` | The manifest, the `types` contract, and the `minimumSightings` and `linkCheckMinutes` options. |
 | `.claude-plugin/marketplace.json` | The one-plugin marketplace. |
 | `hooks/hooks.json` | Names the hooks module, `./register.tsx`. |
 | `hooks/register.tsx` | Every hook and every `$` call: recording, loading, presses, band, pane, and command. |
 | `hooks/views.tsx` | The band tree, the pane tree, and the text report. |
 | `hooks/words.ts` | The sentences of the band, the pane, the report, the command, and the notices. |
 | `hooks/verdicts.ts` | The verdict of each target against the current settings. |
-| `hooks/settings-file.ts` | Parses, edits, and serializes the user settings file, and checks the shape of a journal entry. |
+| `hooks/settings-file.ts` | Parses, edits, and serializes the user settings file, formats and parses the record of its lock file, and checks the shape of a journal entry. |
 | `hooks/sightings.ts` | Reads one Bash call into sightings. |
 | `hooks/records.ts` | The saved records and the journal: store keys, merge, shape, retention, and the band's fixed-since rule. |
 | `hooks/names.ts` | The naming rules for hosts, paths, cache folders, protected names, and commands. |
