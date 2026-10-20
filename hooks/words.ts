@@ -19,6 +19,8 @@ export const NOTHING_TO_UNDO = 'Nothing to undo.'
 export const NOTHING_TO_CHANGE = 'Nothing to change: the target is no longer listed.'
 export const APPLY_HINT = 'To apply a fix, run /sandbox-tuner in an interactive session and press Allow or Deny.'
 export const COMMAND_DESCRIPTION = 'Review the hosts and write folders the sandbox keeps blocking.'
+// The keyboard path to the band Buttons, drawn dim after them: Claude Code's focus chord, then Tab, Enter, or Esc.
+export const BAND_KEY_HINT = 'ctrl+x tab to choose'
 export const STILL_BLOCKED = 'If the sandbox still blocks it, the cause is elsewhere, such as a tool that ignores the sandbox proxy, a read block, or file permissions. Check the client’s proxy settings and supported protocols. Run /status or /doctor for managed-settings warnings.'
 
 const SHARED_FOLDER = 'Every app you run keeps files in this folder, so sandboxed commands could change files that other apps read.'

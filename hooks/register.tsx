@@ -1157,7 +1157,7 @@ export const register: Register = (on, options) => {
         allow: () => {}, deny: () => {},
         open: () => void runPress($, 'band-open', () => openPress($)),
         dismiss: () => void runPress($, 'band-dismiss', () => dismissPress($, last.recordKey)),
-      }, await next(e))
+      }, await next(e), e.props.bodyColumns)
     }
     const record = (await read($, records)).find(item => item.key === last.recordKey)
     if (record === undefined || record.isHidden || (await read($, dismissed)) === last.recordKey || isFixedSince(await read($, applied), last)) return next(e)
@@ -1169,7 +1169,7 @@ export const register: Register = (on, options) => {
       deny: () => void runPress($, 'band-deny', () => applyFix($, threshold, record.key, 'deny', 'band-deny')),
       open: () => void runPress($, 'band-open', () => openPress($)),
       dismiss: () => void runPress($, 'band-dismiss', () => dismissPress($, record.key)),
-    }, beneath)
+    }, beneath, e.props.bodyColumns)
   }).catch(($, e, next) => {
     hookFailed($, 'ui.render', 'AbovePrompt', next.error)
     return next(e)

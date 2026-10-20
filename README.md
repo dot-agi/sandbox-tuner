@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.2-555555" alt="Version: 1.1.2">
+  <img src="https://img.shields.io/badge/version-1.1.3-555555" alt="Version: 1.1.3">
 </p>
 
 <p align="center"><strong>Sandbox Tuner turns recurring Claude Code sandbox blocks into reviewed, undoable settings edits across sessions.</strong></p>
@@ -127,7 +127,7 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 | `/sandbox-tuner` | Opens the pane and loads the sightings that other sessions saved. Prints the text report when the app cannot place the pane. |
 | `claude -p "/sandbox-tuner"` | Prints the ranking as text. Never writes settings. |
 
-The band's buttons have no hotkeys. Click one, or press Ctrl+X, then Tab, to focus the band, then Tab to the button and Enter.
+The band's buttons have no hotkeys. Click one, or press Ctrl+X, then Tab, to focus the band. Then Tab moves between the buttons, Enter presses one, and Esc goes back to the prompt. When the row has room, the band shows this path after its last button, dim: `ctrl+x tab to choose`.
 Ctrl+X, then Tab is Claude Code's own focus chord. Release Ctrl before Tab: many terminals read Ctrl+Tab as next tab.
 In Emacs terminals, click the band's button, or rebind `abovePrompt:focus` with [`/keybindings`](https://code.claude.com/docs/en/keybindings#above-prompt-actions).
 In the pane, Tab moves between buttons, Enter presses one, the arrow keys scroll, and Esc closes it.
