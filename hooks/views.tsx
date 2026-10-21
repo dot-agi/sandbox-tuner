@@ -2,7 +2,7 @@
 
 import type { BoxProps, ButtonProps, ElementConstructor, RenderElement, RenderNode, TextProps } from 'claude-code'
 
-import type { SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, SandboxTunerRecord } from '../types'
+import type { SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
 import { cutText, plainText } from './names'
 import { isUndoUnresolved } from './records'
 import { fileInfo } from './settings-file'
@@ -108,8 +108,9 @@ type PaneSection = { title: string; rows: RecordRow[] }
 type AppliedRow = { id: string; line: string; undo: string | null; retry: boolean }
 
 // `reformatted`: the settings files of the journal that are not in the 2-space JSON format, so an Undo re-formats them.
-type PaneInput = { rated: readonly Rated[]; applied: readonly SandboxTunerApplied[]; reformatted: readonly string[]; appliedOffset: number; notice: SandboxTunerNotice | null; fault: string | null; isSandboxOn: boolean; context: Context; now: number }
-type PaneModel = { header: string; isSandboxOn: boolean; notice: SandboxTunerNotice | null; fault: string | null; sections: PaneSection[]; hidden: { key: string; target: string }[]; applied: AppliedRow[]; appliedOffset: number }
+// `scope`: the scope option, which names what an empty pane has not seen.
+type PaneInput = { rated: readonly Rated[]; applied: readonly SandboxTunerApplied[]; reformatted: readonly string[]; appliedOffset: number; notice: SandboxTunerNotice | null; fault: string | null; isSandboxOn: boolean; context: Context; now: number; scope: SandboxTunerScope }
+type PaneModel = { header: string; isSandboxOn: boolean; notice: SandboxTunerNotice | null; fault: string | null; sections: PaneSection[]; hidden: { key: string; target: string }[]; applied: AppliedRow[]; appliedOffset: number; empty: string }
 type PaneActions = { allow: (key: string) => void; deny: (key: string) => void; hide: (key: string) => void; unhide: (key: string) => void; undo: (id: string) => void; moveApplied: (delta: number) => void }
 
 function visible(rated: readonly Rated[]): Rated[] {
@@ -141,6 +142,7 @@ export function buildPane(input: PaneInput): PaneModel {
     notice: input.notice,
     fault: input.fault,
     appliedOffset: Math.max(0, Math.min(input.appliedOffset, input.applied.length - 1)),
+    empty: NO_BLOCKS[input.scope],
     sections: SECTIONS.map(({ kind, title }) => ({
       title,
       rows: shown.filter(({ record }) => record.kind === kind).map(rated => recordRow(rated, context, now)),
@@ -240,7 +242,7 @@ export function paneTree(kit: Kit, model: PaneModel, actions: PaneActions): Rend
   return (
     <Box flexDirection="column" gap={1}>
       {head}
-      {isEmpty ? <Text dimColor>{NO_BLOCKS}</Text> : null}
+      {isEmpty ? <Text dimColor>{model.empty}</Text> : null}
       {sections}
       {hidden}
       {applied}
@@ -252,8 +254,8 @@ function statusCount(rated: readonly Rated[], status: Verdict['status']): number
   return rated.filter(({ verdict }) => verdict.status === status).length
 }
 
-export function reportText(rated: readonly Rated[], context: Context, isSandboxOn: boolean, now: number): string {
-  if (rated.length === 0) return NO_BLOCKS
+export function reportText(rated: readonly Rated[], context: Context, isSandboxOn: boolean, now: number, scope: SandboxTunerScope): string {
+  if (rated.length === 0) return NO_BLOCKS[scope]
   const shown = visible(rated)
   const lines = [
     reportHeadline({ ready: statusCount(shown, 'ready'), waiting: statusCount(shown, 'waiting'), 'no-fix': statusCount(shown, 'no-fix'), covered: statusCount(shown, 'covered') }),

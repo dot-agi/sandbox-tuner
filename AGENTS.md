@@ -43,7 +43,7 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 
 | Path | Content |
 | --- | --- |
-| `.claude-plugin/plugin.json` | The manifest, the `types` contract, and the `minimumSightings` and `linkCheckMinutes` options. |
+| `.claude-plugin/plugin.json` | The manifest, the `types` contract, and the `minimumSightings`, `linkCheckMinutes`, and `scope` options. |
 | `.claude-plugin/marketplace.json` | The one-plugin marketplace. |
 | `hooks/hooks.json` | Names the hooks module, `./register.tsx`. |
 | `hooks/register.tsx` | Every hook and every `$` call: recording, loading, presses, band, pane, and command. |
@@ -55,7 +55,7 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 | `hooks/records.ts` | The saved records and the journal: store keys, merge, shape, retention, and the band's fixed-since rule. |
 | `hooks/names.ts` | The naming rules for hosts, paths, cache folders, protected names, and commands. |
 | `hooks/shapes.ts` | JSON shape checks. |
-| `hooks/diagnostics.ts` | The diagnostic form. |
+| `hooks/diagnostics.ts` | The diagnostic form, and the cause that the band, the pane, and the report show with `scope: session`. |
 | `types/index.d.ts` | The shared types and the `$.state` contract. |
 | `tests/` | Local test files (`*.test.ts`) for the test kit. Git does not track them. |
 

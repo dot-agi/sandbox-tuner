@@ -187,6 +187,7 @@ export function isApplied(value: unknown): value is SandboxTunerApplied {
     isCount(value.appliedAt) &&
     (value.undoneAt === null || isCount(value.undoneAt)) &&
     (value.applyState === undefined || (value.applyState === 'pending' && value.undoneAt === null)) &&
-    (value.undoState === undefined || (value.undoneAt !== null && ['pending', 'retry', 'superseded'].includes(String(value.undoState))))
+    (value.undoState === undefined || (value.undoneAt !== null && ['pending', 'retry', 'superseded'].includes(String(value.undoState)))) &&
+    (value.session === undefined || isText(value.session))
   )
 }

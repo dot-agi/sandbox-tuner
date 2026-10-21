@@ -102,6 +102,17 @@ export function shownRecords(records: readonly SandboxTunerRecord[], now: number
   return records.filter(record => !stale.has(record.key))
 }
 
+/** Every writer's record of each target that a record of `sessionId` names: so the counts keep every session. */
+export function seenIn(records: readonly SandboxTunerRecord[], sessionId: string): SandboxTunerRecord[] {
+  const keys = new Set(records.filter(record => record.sessions.includes(sessionId)).map(record => record.key))
+  return records.filter(record => keys.has(record.key))
+}
+
+/** The journal entries that a press of `sessionId` saved. An entry of Sandbox Tuner 1.1.3 names no session. */
+export function appliedIn(journal: readonly SandboxTunerApplied[], sessionId: string): SandboxTunerApplied[] {
+  return journal.filter(entry => entry.session === sessionId)
+}
+
 /** The 50 newest history entries plus every unresolved edit, oldest first. */
 export function journalOf(entries: readonly SandboxTunerApplied[]): SandboxTunerApplied[] {
   const sorted = [...entries].sort((a, b) => a.appliedAt - b.appliedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
