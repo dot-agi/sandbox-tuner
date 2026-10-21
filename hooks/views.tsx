@@ -8,7 +8,7 @@ import { isUndoUnresolved } from './records'
 import { fileInfo } from './settings-file'
 import type { Context, Rated, Verdict } from './verdicts'
 import {
-  APPLIED_NEXT, APPLIED_PREVIOUS, APPLY_HINT, NO_BLOCKS, SANDBOX_OFF, STILL_BLOCKED, appliedLine, countsSentence, countsSummary, displayTarget, explanation, lastProblem, moreRows,
+  APPLIED_NEXT, APPLIED_PREVIOUS, APPLY_HINT, BAND_KEY_HINT, NO_BLOCKS, SANDBOX_OFF, STILL_BLOCKED, appliedLine, countsSentence, countsSummary, displayTarget, explanation, lastProblem, moreRows,
   openedLine, reformatSentence, reportHeadline, settingsHeader, undoSentence, verdictSentences,
 } from './words'
 
@@ -48,12 +48,28 @@ export function buildObservation(latest: SandboxTunerLatest, notice: SandboxTune
   }
 }
 
+const BAND_LABELS = { allow: 'Allow', deny: 'Deny', open: 'Open Sandbox Tuner', dismiss: 'Dismiss' } as const
+// The band's padding at each side, and the cells between the elements of its Button row.
+const BAND_PADDING = 1
+const ROW_GAP = 2
+
+/**
+ * Whether the key hint fits after the Buttons on one row of `bodyColumns` cells (types AbovePrompt.bodyColumns), with
+ * the terminal's measure: it draws a Button as `[ label ]`. Else the hint is left out, so the row never wraps.
+ */
+export function hasHintRoom(labels: readonly string[], bodyColumns: number): boolean {
+  const buttons = labels.reduce((sum, label) => sum + label.length + 4, 0)
+  return 2 * BAND_PADDING + buttons + ROW_GAP * labels.length + BAND_KEY_HINT.length <= bodyColumns
+}
+
 // No band Button has a hotkey: a bare digit typed into an empty prompt would press it (types ButtonProps.hotkey).
-export function bandTree(kit: Kit, model: BandModel, actions: BandActions, beneath: RenderElement): RenderElement {
+// The AbovePrompt render input does not say whether the band holds the focus, so the key hint stays the same.
+export function bandTree(kit: Kit, model: BandModel, actions: BandActions, beneath: RenderElement, bodyColumns: number): RenderElement {
   const { Box, Text, Button } = kit
+  const labels = [...(model.canAllow ? [BAND_LABELS.allow] : []), ...(model.canDeny ? [BAND_LABELS.deny] : []), BAND_LABELS.open, BAND_LABELS.dismiss]
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column" paddingX={1}>
+      <Box flexDirection="column" paddingX={BAND_PADDING}>
         <Text wrap="wrap">{model.explanation}</Text>
         <Text dimColor>{model.counts}</Text>
         {model.sentences.map(sentence => (
@@ -64,11 +80,12 @@ export function bandTree(kit: Kit, model: BandModel, actions: BandActions, benea
             {drawable(model.error)}
           </Text>
         )}
-        <Box gap={2}>
-          {model.canAllow ? <Button key="band-allow" label="Allow" variant="primary" onPress={actions.allow} /> : null}
-          {model.canDeny ? <Button key="band-deny" label="Deny" onPress={actions.deny} /> : null}
-          <Button key="band-open" label="Open Sandbox Tuner" onPress={actions.open} />
-          <Button key="band-dismiss" label="Dismiss" role="dismiss" onPress={actions.dismiss} />
+        <Box gap={ROW_GAP}>
+          {model.canAllow ? <Button key="band-allow" label={BAND_LABELS.allow} variant="primary" onPress={actions.allow} /> : null}
+          {model.canDeny ? <Button key="band-deny" label={BAND_LABELS.deny} onPress={actions.deny} /> : null}
+          <Button key="band-open" label={BAND_LABELS.open} onPress={actions.open} />
+          <Button key="band-dismiss" label={BAND_LABELS.dismiss} role="dismiss" onPress={actions.dismiss} />
+          {hasHintRoom(labels, bodyColumns) ? <Text dimColor wrap="truncate-end">{BAND_KEY_HINT}</Text> : null}
         </Box>
       </Box>
       {beneath}

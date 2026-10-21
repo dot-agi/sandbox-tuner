@@ -47,7 +47,7 @@ On the terminal and in the desktop app, the band above the prompt explains the l
 | Open Sandbox Tuner | Always | Opens the pane. |
 | Dismiss | Always | Hides the band for this target for the rest of the session. Dismissing another target replaces it. |
 
-The band's Buttons have no hotkeys, so a number that you type alone into an empty prompt never presses one. Click a Button, or press Ctrl+X, then Tab, to give the band the focus, then Tab to the Button and Enter.
+The band's Buttons have no hotkeys, so a number that you type alone into an empty prompt never presses one. Click a Button, or press Ctrl+X, then Tab, to give the band the focus. Then Tab moves between the Buttons, Enter presses one, and Esc goes back to the prompt. When the row has room, the band shows this path after its last Button, dim: `ctrl+x tab to choose`. On a narrow row, the band leaves the hint out, so that the Buttons stay on one row.
 Ctrl+X, then Tab is Claude Code's own focus chord. Release Ctrl before Tab: many terminals read Ctrl+Tab as next tab.
 In Emacs terminals, click the band's Button, or rebind `abovePrompt:focus` with [`/keybindings`](https://code.claude.com/docs/en/keybindings#above-prompt-actions).
 
