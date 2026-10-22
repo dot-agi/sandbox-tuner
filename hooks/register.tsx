@@ -120,10 +120,10 @@ async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[
  * The session id that the sightings of a call name: with scope session, the session that ran the call (`origin`, read
  * before the call ran), and with scope all, read now (`origin` null), as in Sandbox Tuner 1.1.3.
  */
-async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | null): Promise<string | null> {
+async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | null, isShown: boolean): Promise<string | null> {
   const found = origin ?? (await sessionOrigin($))
   if (found.session !== null) return found.session
-  await noteFault($, diagnostic('tool.call', tool, `could not read the session id: ${found.cause}`))
+  await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read the session id: ${found.cause}`))
   return null
 }
 
@@ -150,7 +150,8 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
 /**
  * Records the sandbox blocks of one call. With scope session, `origin` is the session that ran it, read before it ran.
  * When /clear, /resume, or /branch started another session during the call, its sightings name the session that ran
- * it, and the session now shows nothing of it: its problems go to the debug log only.
+ * it, and the session now shows nothing of it: its problems go to the debug log only. A call whose session is unknown
+ * shows in no session, the same way.
  */
 async function recordCall($: EngineInterface, scope: SandboxTunerScope, origin: Origin | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
   if (signal.aborted) return
@@ -158,7 +159,7 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, origin: 
   if (taskId !== undefined && (await read($, backgroundTasks)).includes(taskId)) return
   const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), await $.session.cwd())
   const isQuiet = reports.length === 0 && gated.length === 0 && unknownLine === null && observation === undefined
-  const isShown = origin === null || origin.session === null || isQuiet || (await isSessionNow($, scope, origin.session))
+  const isShown = origin === null || isQuiet || (await isSessionNow($, scope, origin.session))
   // The debug log only: the pane would show a block that the command printed as a problem.
   if (skipped) logDebug($, diagnostic('tool.call', tool, 'skipped a <sandbox_violations> block that does not end the text of a failed call (not quoted: the command can print one)'))
   if (unknownLine !== null) {
@@ -175,7 +176,7 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, origin: 
   }
   if (taskId !== undefined) await update($, backgroundTasks, list => [...list, taskId])
   if (sightings.length === 0) return
-  const sessionId = await sessionIdOf($, tool, origin)
+  const sessionId = await sessionIdOf($, tool, origin, isShown)
   const now = await $.clock.now()
   for (const sighting of sightings) {
     if (signal.aborted) return
