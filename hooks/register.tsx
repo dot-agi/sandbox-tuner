@@ -101,6 +101,17 @@ async function sessionOrigin($: EngineInterface): Promise<Origin> {
   }
 }
 
+/**
+ * What a call starts in, read before it runs with scope session: its session, and its working directory, which
+ * resolves a relative path in its output. Null when the working directory cannot be read: then the call reads it again
+ * once it ends.
+ */
+type CallStart = { origin: Origin; cwd: string | null }
+
+async function callStart($: EngineInterface): Promise<CallStart> {
+  return { origin: await sessionOrigin($), cwd: await $.session.cwd().catch(() => null) }
+}
+
 /** Keeps a problem of a call for the pane (noteFault), or only in the debug log for a call of another session. */
 async function noteCallFault($: EngineInterface, isShown: boolean, text: string, shown = text): Promise<void> {
   if (isShown) await noteFault($, text, shown)
@@ -148,16 +159,18 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
 }
 
 /**
- * Records the sandbox blocks of one call. With scope session, `origin` is the session that ran it, read before it ran.
- * When /clear, /resume, or /branch started another session during the call, its sightings name the session that ran
- * it, and the session now shows nothing of it: its problems go to the debug log only. A call whose session is unknown
- * shows in no session, the same way.
+ * Records the sandbox blocks of one call. With scope session, `start` holds the session that ran it and its working
+ * directory, read before it ran. When /clear, /resume, or /branch started another session during the call, its
+ * sightings name the session that ran it, and the session now shows nothing of it: its problems go to the debug log
+ * only. A call whose session is unknown shows in no session, the same way. With scope all (`start` null), both are read
+ * once the call ends, as in Sandbox Tuner 1.1.3.
  */
-async function recordCall($: EngineInterface, scope: SandboxTunerScope, origin: Origin | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
+async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: CallStart | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
   if (signal.aborted) return
   const taskId = outcome.backgroundTaskId
   if (taskId !== undefined && (await read($, backgroundTasks)).includes(taskId)) return
-  const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), await $.session.cwd())
+  const origin = start?.origin ?? null
+  const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), start?.cwd ?? (await $.session.cwd()))
   const isQuiet = reports.length === 0 && gated.length === 0 && unknownLine === null && observation === undefined
   const isShown = origin === null || isQuiet || (await isSessionNow($, scope, origin.session))
   // The debug log only: the pane would show a block that the command printed as a problem.
@@ -405,7 +418,7 @@ async function lockLoss($: EngineInterface, file: FileInfo, token: string): Prom
  * the change went into. The copy is `backups/settings.json.sandbox-tuner.bak` in the same folder (fileInfo). The press
  * holds the lock of the file (`token`).
  */
-async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string): Promise<PressResult | null> {
+async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string, sessionChange: SessionCheck): Promise<PressResult | null> {
   const previous = original === null ? 'The file did not exist before.' : `The previous file is saved at ${file.backupDisplay}.`
   if (original !== null) {
     try {
@@ -417,13 +430,13 @@ async function writeSettings($: EngineInterface, buttonKey: string, file: FileIn
   const pending = await saveJournal($, { buttonKey, file, entry, success: '', didWrite: false })
   if (pending.isError) return pending
   // $.fs has no conditional write: check last that no other session or program saved the file since the press read it,
-  // and that no other press took the lock over.
+  // that no other press took the lock over, and with scope session, that the session of the press is still current.
   const change = await fileText($, file.path).then(
     current => (current === original ? null : 'another program changed it'),
     (error: unknown) => causeOf(error),
   )
   const stop = change === null
-    ? await lockLoss($, file, token)
+    ? (await lockLoss($, file, token)) ?? (await sessionChange())
     : `could not confirm that ${file.display} is unchanged since Sandbox Tuner read it (${change}). Sandbox Tuner left the file as it is. Press again.`
   if (stop !== null) {
     // No settings write was attempted, so this addition cannot own an entry in the file.
@@ -979,7 +992,7 @@ async function refitEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * holds now, and writes it. An addition gets a time later than each change of its entry that the journal holds now, as
  * a press of another session can have saved one while this press waited for the lock.
  */
-async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string): Promise<PressResult> {
+async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string, sessionChange: SessionCheck): Promise<PressResult> {
   const checked = await recheckPlan($, buttonKey, first)
   if (!('value' in checked)) return checked
   const read = await readText($, file, buttonKey)
@@ -988,7 +1001,7 @@ async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
   if (!('value' in planned)) return planned
   const { loaded, value, success } = planned
   const entry = 'change' in planned ? { ...planned.entry, appliedAt: laterThanJournal(await readJournal($), file, planned.change, planned.entry.appliedAt) } : planned.entry
-  const problem = await writeSettings($, buttonKey, file, loaded.original, serializeSettings(value, loaded.parsed), entry, token)
+  const problem = await writeSettings($, buttonKey, file, loaded.original, serializeSettings(value, loaded.parsed), entry, token, sessionChange)
   if (problem !== null) return problem
   return saveJournal($, { buttonKey, file, entry: { ...entry, applyState: undefined }, success, didWrite: true })
 }
@@ -999,7 +1012,7 @@ async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * under the lock, the checks of the file run again when the text changed between the reads, and the unchanged-file
  * check right before the write compares with the second read.
  */
-async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit): Promise<PressResult> {
+async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit, sessionChange: SessionCheck): Promise<PressResult> {
   const loaded = await readSettingsFile($, file, buttonKey)
   if (!('parsed' in loaded)) return loaded
   const planned = await planEdit($, buttonKey, file, edit, loaded)
@@ -1007,7 +1020,7 @@ async function editSettings($: EngineInterface, buttonKey: string, file: FileInf
   const token = await takeLock($, file, buttonKey)
   if (typeof token !== 'string') return token
   try {
-    return await writeEdit($, buttonKey, file, planned, token)
+    return await writeEdit($, buttonKey, file, planned, token, sessionChange)
   } finally {
     await freeLock($, file, token, buttonKey)
   }
@@ -1019,11 +1032,29 @@ async function targetRecord($: EngineInterface, key: string, buttonKey: string):
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
 
+/** Why a press stops right before its settings write, or null when it goes on (pressStop). */
+type SessionCheck = () => Promise<string | null>
+
+/**
+ * Why a press of session `origin` does not run now, or null when it runs. With scope session, a press runs only in the
+ * session where it was pressed: /clear, /resume, or /branch can start another session while the press waits in the
+ * module queue, or during its reads before the settings write. With scope all, every press runs, as in 1.1.3.
+ */
+async function pressStop($: EngineInterface, scope: SandboxTunerScope, origin: Origin): Promise<string | null> {
+  if (scope === 'all') return null
+  if (origin.session === null) return `could not read the session id: ${origin.cause}. Nothing was written.`
+  try {
+    return (await $.session.id()) === origin.session ? null : 'another session started after this press. Nothing was written.'
+  } catch (error) {
+    return `could not read the session id: ${causeOf(error)}. Nothing was written.`
+  }
+}
+
 /**
  * The session id that the journal entry of a press keeps: the session of the press (`origin`), also when /clear,
  * /resume, or /branch started another session while the press waited. With scope all, a press whose session is unknown
  * goes on and its entry names no session, as in Sandbox Tuner 1.1.3. With scope session, it stops: the Applied list of
- * the session would not show its Undo.
+ * the session would not show its Undo. (pressStop already stops such a press in the module queue.)
  */
 function pressSession(scope: SandboxTunerScope, buttonKey: string, origin: Origin): { session: string | undefined } | PressResult {
   if (origin.session !== null) return { session: origin.session }
@@ -1042,7 +1073,7 @@ async function applyFix($: EngineInterface, threshold: number, scope: SandboxTun
   if (context.file === undefined) return info(nothingApplied(verdictSentences(record, verdictOf(record, context), context)))
   const pressed = pressSession(scope, buttonKey, origin)
   if (!('session' in pressed)) return pressed
-  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context, session: pressed.session })
+  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context, session: pressed.session }, () => pressStop($, scope, origin))
 }
 
 async function openPress($: EngineInterface, scope: SandboxTunerScope): Promise<PressResult | null> {
@@ -1152,16 +1183,24 @@ async function confirmChange($: EngineInterface, scope: SandboxTunerScope, butto
 
 /**
  * Runs one press in the module queue, with the session of the press (sessionOrigin), and shows its result: with scope
- * session, only in that session (isSessionNow). It never rejects: a Button drops what onPress returns.
+ * session, it runs and shows only in that session (pressStop, isSessionNow). It never rejects: a Button drops what
+ * onPress returns.
  */
 async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>): Promise<void> {
   const origin = await sessionOrigin($)
-  const result = await enqueue(() => action(origin).catch((error: unknown) => {
-    const cause = shownCause(scope, error)
-    // The debug log keeps the cause that the band and the pane leave out.
-    if (cause !== causeOf(error)) logDebug($, diagnostic('ui.press', buttonKey, causeOf(error)))
-    return failure(buttonKey, cause)
-  }))
+  const result = await enqueue(async () => {
+    const stop = await pressStop($, scope, origin)
+    if (stop !== null) {
+      logDebug($, diagnostic('ui.press', buttonKey, stop))
+      return null
+    }
+    return action(origin).catch((error: unknown) => {
+      const cause = shownCause(scope, error)
+      // The debug log keeps the cause that the band and the pane leave out.
+      if (cause !== causeOf(error)) logDebug($, diagnostic('ui.press', buttonKey, causeOf(error)))
+      return failure(buttonKey, cause)
+    })
+  })
   if (result === null) return
   if (result.isError) logDebug($, result.text)
   const isShown = await isSessionNow($, scope, origin.session)
@@ -1233,11 +1272,11 @@ function undoable(journal: readonly SandboxTunerApplied[], id: string, buttonKey
   return hasLaterOwner(journal, entry) ? failure(buttonKey, 'a later journal entry owns this setting. Nothing was written. Reopen the pane.') : entry
 }
 
-async function undoFix($: EngineInterface, id: string, buttonKey: string): Promise<PressResult> {
+async function undoFix($: EngineInterface, scope: SandboxTunerScope, id: string, buttonKey: string, origin: Origin): Promise<PressResult> {
   const entry = undoable(await readJournal($), id, buttonKey)
   if (!('id' in entry)) return entry
   const file = fileInfo(entry.file, await homeOf($))
-  return editSettings($, buttonKey, file, { kind: 'remove', entry })
+  return editSettings($, buttonKey, file, { kind: 'remove', entry }, () => pressStop($, scope, origin))
 }
 
 /** The rows of the Applied list: with scope session, only the edits that a press of the current session saved. */
@@ -1307,12 +1346,12 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    // With scope session, the session that runs the call, read before it runs: /clear, /resume, or /branch can start
-    // another session while it runs.
-    const origin = scope === 'session' ? await sessionOrigin($) : null
+    // With scope session, the session and the working directory of the call, read before it runs: /clear, /resume, or
+    // /branch can start another session while it runs.
+    const start = scope === 'session' ? await callStart($) : null
     const out = await next(e)
     // The wait for the queue counts as this hook's own time, so the job stops once the dispatch is abandoned.
-    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, origin, toCall(e), toOutcome(out), next.signal))
+    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, start, toCall(e), toOutcome(out), next.signal))
     return out
   }).catch(($, e, next) => {
     hookFailed($, 'tool.call', 'Bash', next.error)
@@ -1320,10 +1359,10 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
-    const origin = scope === 'session' ? await sessionOrigin($) : null
+    const start = scope === 'session' ? await callStart($) : null
     const out = await next(e)
     if (!next.signal.aborted && e.command !== undefined && e.ws === undefined && out.deny === undefined && out.isError !== true && out.result.taskId !== '') {
-      await enqueue(() => recordCall($, scope, origin, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
+      await enqueue(() => recordCall($, scope, start, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
         { isDenied: false, isError: false, backgroundTaskId: out.result.taskId, text: '', stderr: '' }, next.signal, 'Monitor'))
     }
     return out
@@ -1381,7 +1420,7 @@ export const register: Register = (on, options) => {
       deny: key => void runPress($, scope, `deny:${key}`, origin => applyFix($, threshold, scope, key, 'deny', `deny:${key}`, origin)),
       hide: key => void runPress($, scope, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
       unhide: key => void runPress($, scope, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),
-      undo: id => void runPress($, scope, `undo:${id}`, () => undoFix($, id, `undo:${id}`)),
+      undo: id => void runPress($, scope, `undo:${id}`, origin => undoFix($, scope, id, `undo:${id}`, origin)),
       moveApplied: delta => void runPress($, scope, delta < 0 ? 'applied-previous' : 'applied-next', () => moveApplied($, scope, delta)),
     })
   }).catch(($, e, next) => {
