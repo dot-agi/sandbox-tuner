@@ -64,12 +64,13 @@ export function hasHintRoom(labels: readonly string[], bodyColumns: number): boo
 
 // No band Button has a hotkey: a bare digit typed into an empty prompt would press it (types ButtonProps.hotkey).
 // The AbovePrompt render input does not say whether the band holds the focus, so the key hint stays the same.
+// One blank row above the band, so it does not look like the last line of the transcript.
 export function bandTree(kit: Kit, model: BandModel, actions: BandActions, beneath: RenderElement, bodyColumns: number): RenderElement {
   const { Box, Text, Button } = kit
   const labels = [...(model.canAllow ? [BAND_LABELS.allow] : []), ...(model.canDeny ? [BAND_LABELS.deny] : []), BAND_LABELS.open, BAND_LABELS.dismiss]
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column" paddingX={BAND_PADDING}>
+      <Box flexDirection="column" paddingX={BAND_PADDING} marginTop={1}>
         <Text wrap="wrap">{model.explanation}</Text>
         <Text dimColor>{model.counts}</Text>
         {model.sentences.map(sentence => (
