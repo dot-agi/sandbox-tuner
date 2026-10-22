@@ -418,7 +418,7 @@ async function lockLoss($: EngineInterface, file: FileInfo, token: string): Prom
  * the change went into. The copy is `backups/settings.json.sandbox-tuner.bak` in the same folder (fileInfo). The press
  * holds the lock of the file (`token`).
  */
-async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string, sessionChange: SessionCheck): Promise<PressResult | null> {
+async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string, sessionChange: () => Promise<string | null>): Promise<PressResult | null> {
   const previous = original === null ? 'The file did not exist before.' : `The previous file is saved at ${file.backupDisplay}.`
   if (original !== null) {
     try {
@@ -992,7 +992,7 @@ async function refitEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * holds now, and writes it. An addition gets a time later than each change of its entry that the journal holds now, as
  * a press of another session can have saved one while this press waited for the lock.
  */
-async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string, sessionChange: SessionCheck): Promise<PressResult> {
+async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string, sessionChange: () => Promise<string | null>): Promise<PressResult> {
   const checked = await recheckPlan($, buttonKey, first)
   if (!('value' in checked)) return checked
   const read = await readText($, file, buttonKey)
@@ -1012,7 +1012,7 @@ async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * under the lock, the checks of the file run again when the text changed between the reads, and the unchanged-file
  * check right before the write compares with the second read.
  */
-async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit, sessionChange: SessionCheck): Promise<PressResult> {
+async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit, sessionChange: () => Promise<string | null>): Promise<PressResult> {
   const loaded = await readSettingsFile($, file, buttonKey)
   if (!('parsed' in loaded)) return loaded
   const planned = await planEdit($, buttonKey, file, edit, loaded)
@@ -1031,9 +1031,6 @@ async function targetRecord($: EngineInterface, key: string, buttonKey: string):
   if (await read($, evidenceIncomplete)) return failure(buttonKey, 'some sightings could not be saved. Durable safety evidence is incomplete. Nothing was written.')
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
-
-/** Why a press stops right before its settings write, or null when it goes on (pressStop). */
-type SessionCheck = () => Promise<string | null>
 
 /**
  * Why a press of session `origin` does not run now, or null when it runs. With scope session, a press runs only in the
