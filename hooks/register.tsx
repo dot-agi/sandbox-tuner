@@ -89,25 +89,46 @@ function toOutcome(out: ToolCallResult<'Bash'>): BashOutcome {
   return { isDenied: false, isError: false, isReadOnly: out.isReadOnly === true, backgroundTaskId: out.result.backgroundTaskId, isUnsandboxed: out.result.dangerouslyDisableSandbox, text: out.text ?? '', stderr: out.result.stderr }
 }
 
-async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[], tool: string): Promise<Sighting[]> {
+/** The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it. */
+type Origin = { session: string } | { session: null; cause: string }
+
+/** Reads the session of a press or a tool call when it starts, before it waits for the call or the module queue. */
+async function sessionOrigin($: EngineInterface): Promise<Origin> {
+  try {
+    return { session: await $.session.id() }
+  } catch (error) {
+    return { session: null, cause: causeOf(error) }
+  }
+}
+
+/** Keeps a problem of a call for the pane (noteFault), or only in the debug log for a call of another session. */
+async function noteCallFault($: EngineInterface, isShown: boolean, text: string, shown = text): Promise<void> {
+  if (isShown) await noteFault($, text, shown)
+  else logDebug($, text)
+}
+
+async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[], tool: string, isShown: boolean): Promise<Sighting[]> {
   try {
     return keepGated(gated, sandboxFacts(await $.settings.read()))
   } catch (error) {
-    await noteFault($, diagnostic('tool.call', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
+    await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
     return []
   }
 }
 
-async function sessionIdOf($: EngineInterface, tool: string): Promise<string | null> {
-  try {
-    return await $.session.id()
-  } catch (error) {
-    await noteFault($, diagnostic('tool.call', tool, `could not read the session id: ${causeOf(error)}`))
-    return null
-  }
+/**
+ * The session id that the sightings of a call name: with scope session, the session that ran the call (`origin`, read
+ * before the call ran), and with scope all, read now (`origin` null), as in Sandbox Tuner 1.1.3.
+ */
+async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | null): Promise<string | null> {
+  const found = origin ?? (await sessionOrigin($))
+  if (found.session !== null) return found.session
+  await noteFault($, diagnostic('tool.call', tool, `could not read the session id: ${found.cause}`))
+  return null
 }
 
-async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighting: Sighting, sessionId: string | null, now: number, tool: string): Promise<void> {
+/** Saves one sighting. It adds the target to the targets that the pane shows only for a call of this session (`isShown`). */
+async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighting: Sighting, sessionId: string | null, now: number, tool: string, isShown: boolean): Promise<void> {
   const key = recordKey(sighting)
   try {
     const storeKey = `${WRITER_PREFIX}${writerId}:${key}`
@@ -117,20 +138,27 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
     const refreshed = (await readRecords($, key))[0]
     if (refreshed === undefined) throw new Error('saved evidence was not returned by the store')
     // With scope session, a sighting with no session id names no session: it adds no target, and a load would not show it.
-    const isShown = (list: readonly SandboxTunerRecord[]) => scope === 'all' || sessionId !== null || list.some(record => record.key === key)
-    await update($, records, list => (isShown(list) ? [...list.filter(record => record.key !== key), refreshed] : list))
+    const isListed = (list: readonly SandboxTunerRecord[]) => scope === 'all' || sessionId !== null || list.some(record => record.key === key)
+    if (isShown) await update($, records, list => (isListed(list) ? [...list.filter(record => record.key !== key), refreshed] : list))
   } catch (error) {
     await update($, evidenceIncomplete, () => true)
     const problem = (cause: string) => diagnostic('tool.call', tool, `could not save the sighting of ${key}: ${cause}`)
-    await noteFault($, problem(causeOf(error)), problem(shownCause(scope, error)))
+    await noteCallFault($, isShown, problem(causeOf(error)), problem(shownCause(scope, error)))
   }
 }
 
-async function recordCall($: EngineInterface, scope: SandboxTunerScope, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
+/**
+ * Records the sandbox blocks of one call. With scope session, `origin` is the session that ran it, read before it ran.
+ * When /clear, /resume, or /branch started another session during the call, its sightings name the session that ran
+ * it, and the session now shows nothing of it: its problems go to the debug log only.
+ */
+async function recordCall($: EngineInterface, scope: SandboxTunerScope, origin: Origin | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
   if (signal.aborted) return
   const taskId = outcome.backgroundTaskId
   if (taskId !== undefined && (await read($, backgroundTasks)).includes(taskId)) return
   const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), await $.session.cwd())
+  const isQuiet = reports.length === 0 && gated.length === 0 && unknownLine === null && observation === undefined
+  const isShown = origin === null || origin.session === null || isQuiet || (await isSessionNow($, scope, origin.session))
   // The debug log only: the pane would show a block that the command printed as a problem.
   if (skipped) logDebug($, diagnostic('tool.call', tool, 'skipped a <sandbox_violations> block that does not end the text of a failed call (not quoted: the command can print one)'))
   if (unknownLine !== null) {
@@ -138,23 +166,23 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, call: Ba
     const cause = quote === null
       ? `skipped a sandbox report line of an unknown form (${unknownLine.length} characters, not quoted: it does not start like a report line)`
       : `skipped a sandbox report line of an unknown form: ${quote}`
-    await noteFault($, diagnostic('tool.call', tool, cause))
+    await noteCallFault($, isShown, diagnostic('tool.call', tool, cause))
   }
-  const sightings = gated.length === 0 ? reports : [...reports, ...(await gatedSightings($, gated, tool))]
-  if (observation !== undefined) {
+  const sightings = gated.length === 0 ? reports : [...reports, ...(await gatedSightings($, gated, tool, isShown))]
+  if (observation !== undefined && isShown) {
     const at = await $.clock.now()
     await update($, latest, () => ({ recordKey: `observation:${at}`, detail: observation.detail, reason: 'operation', reasonText: observation.operation, command: commandLine(call.command), at }))
   }
   if (taskId !== undefined) await update($, backgroundTasks, list => [...list, taskId])
   if (sightings.length === 0) return
-  const sessionId = await sessionIdOf($, tool)
+  const sessionId = await sessionIdOf($, tool, origin)
   const now = await $.clock.now()
   for (const sighting of sightings) {
     if (signal.aborted) return
-    await saveSighting($, scope, sighting, sessionId, now, tool)
+    await saveSighting($, scope, sighting, sessionId, now, tool, isShown)
   }
   const newest = latestOf(sightings, commandLine(call.command), now)
-  if (newest !== null) await update($, latest, () => newest)
+  if (newest !== null && isShown) await update($, latest, () => newest)
 }
 
 /**
@@ -178,7 +206,7 @@ async function readRecords($: EngineInterface, targetKey?: string, sessionId?: s
   const combined = aggregateRecords(sessionId === undefined ? found : seenIn(found, sessionId))
   for (const record of combined) {
     const hidden = await $.store.get(HIDDEN_PREFIX + record.key)
-    if (hidden !== undefined && typeof hidden !== 'boolean') throw new Error(`invalid hidden preference: ${record.key}`)
+    if (hidden !== undefined && typeof hidden !== 'boolean') throw new KeyFailure('invalid hidden preference', record.key)
     if (typeof hidden === 'boolean') record.isHidden = hidden
   }
   return combined
@@ -990,18 +1018,6 @@ async function targetRecord($: EngineInterface, key: string, buttonKey: string):
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
 
-/** The session of a press, read once when it is pressed: its id, or why Claude Code could not give it. */
-type Origin = { session: string } | { session: null; cause: string }
-
-/** Reads the session of a press when it is pressed, before the press waits in the module queue. */
-async function pressOrigin($: EngineInterface): Promise<Origin> {
-  try {
-    return { session: await $.session.id() }
-  } catch (error) {
-    return { session: null, cause: causeOf(error) }
-  }
-}
-
 /**
  * The session id that the journal entry of a press keeps: the session of the press (`origin`), also when /clear,
  * /resume, or /branch started another session while the press waited. With scope all, a press whose session is unknown
@@ -1134,11 +1150,11 @@ async function confirmChange($: EngineInterface, scope: SandboxTunerScope, butto
 }
 
 /**
- * Runs one press in the module queue, with the session of the press (pressOrigin), and shows its result: with scope
+ * Runs one press in the module queue, with the session of the press (sessionOrigin), and shows its result: with scope
  * session, only in that session (isSessionNow). It never rejects: a Button drops what onPress returns.
  */
 async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>): Promise<void> {
-  const origin = await pressOrigin($)
+  const origin = await sessionOrigin($)
   const result = await enqueue(() => action(origin).catch((error: unknown) => {
     const cause = shownCause(scope, error)
     // The debug log keeps the cause that the band and the pane leave out.
@@ -1290,9 +1306,12 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // With scope session, the session that runs the call, read before it runs: /clear, /resume, or /branch can start
+    // another session while it runs.
+    const origin = scope === 'session' ? await sessionOrigin($) : null
     const out = await next(e)
     // The wait for the queue counts as this hook's own time, so the job stops once the dispatch is abandoned.
-    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, toCall(e), toOutcome(out), next.signal))
+    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, origin, toCall(e), toOutcome(out), next.signal))
     return out
   }).catch(($, e, next) => {
     hookFailed($, 'tool.call', 'Bash', next.error)
@@ -1300,9 +1319,10 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
+    const origin = scope === 'session' ? await sessionOrigin($) : null
     const out = await next(e)
     if (!next.signal.aborted && e.command !== undefined && e.ws === undefined && out.deny === undefined && out.isError !== true && out.result.taskId !== '') {
-      await enqueue(() => recordCall($, scope, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
+      await enqueue(() => recordCall($, scope, origin, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
         { isDenied: false, isError: false, backgroundTaskId: out.result.taskId, text: '', stderr: '' }, next.signal, 'Monitor'))
     }
     return out
