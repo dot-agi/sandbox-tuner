@@ -4,10 +4,10 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.3-555555" alt="Version: 1.1.3">
+  <img src="https://img.shields.io/badge/version-1.1.4-555555" alt="Version: 1.1.4">
 </p>
 
-<p align="center"><strong>Sandbox Tuner turns recurring Claude Code sandbox blocks into reviewed, undoable settings edits across sessions.</strong></p>
+<p align="center"><strong>Sandbox Tuner turns the recurring sandbox blocks of your current Claude Code session into reviewed, undoable settings edits.</strong></p>
 <p align="center"><a href="#why">Why</a> · <a href="#features">Features</a> · <a href="#how-it-works">How it works</a> · <a href="#install">Install</a> · <a href="#commands">Commands</a> · <a href="#known-limits">Known limits</a> · <a href="#privacy">Privacy</a></p>
 
 ![Terminal: a sandboxed curl to example.org fails. The band names the block, counts the sightings, states the exact settings change, and shows Allow.](docs/images/band.svg)
@@ -24,9 +24,10 @@ So Sandbox Tuner reads Bash results, and the hosts that background Bash commands
 ## Features
 
 - **An explanation above the prompt.** The band names the blocked target, the command, and the reason, in the terminal and the desktop app.
-- **A ranking across sessions.** `/sandbox-tuner` lists hosts and write folders, with ready fixes first. Hide the targets that you do not want to see, except a target that your settings already allow.
+- **A ranking for the current session.** `/sandbox-tuner` lists the hosts and write folders that the current session saw, with ready fixes first. Each count also includes the sightings of earlier sessions. Hide the targets that you do not want to see, except a target that your settings already allow.
 - **A change you review.** Allow shows the exact entry and its effect before you press it. Deny appears for a host that you refused at the network prompt, unless an allowlist lock applies.
-- **Undo and a backup.** Each settings edit gets an Undo record. A backup keeps the settings file as it was before the latest write.
+- **Undo and a backup.** Each settings edit gets an Undo record. The pane lists the edits of the current session. A backup keeps the settings file as it was before the latest write.
+- **Every session on request.** Set the `scope` option to `all` to show the targets and the edits of every session, as Sandbox Tuner 1.1.3 does.
 - **Narrow fixes.** Folder grants go only to eligible cache and temp folders. A folder strictly inside `/tmp`, such as `/tmp/build`, can get Allow. A file directly in `/tmp` gets no Allow, because `/tmp` itself is too broad. Sandbox Tuner offers no wildcard hosts and no command exclusions.
 
 ![The Sandbox Tuner pane beside the transcript: example.org is ready with Allow and Hide, example.net waits at 1 of 3 sightings.](docs/images/pane.svg)
@@ -124,8 +125,8 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 
 | Command | What it does |
 | --- | --- |
-| `/sandbox-tuner` | Opens the pane and loads the sightings that other sessions saved. Prints the text report when the app cannot place the pane. |
-| `claude -p "/sandbox-tuner"` | Prints the ranking as text. Never writes settings. |
+| `/sandbox-tuner` | Opens the pane with the targets and edits of the current session, and loads the sightings of those targets that other sessions saved. With `scope: all`, it shows every session's targets and edits. Prints the text report when the app cannot place the pane. |
+| `claude -p "/sandbox-tuner"` | Prints the ranking as text. Never writes settings. A `claude -p` run is a new session, so with the default `scope: session` the report lists no target. Set `scope` to `all` for the ranking of every session. |
 
 The band's buttons have no hotkeys. Click one, or press Ctrl+X, then Tab, to focus the band. Then Tab moves between the buttons, Enter presses one, and Esc goes back to the prompt. When the row has room, the band shows this path after its last button, dim: `ctrl+x tab to choose`.
 Ctrl+X, then Tab is Claude Code's own focus chord. Release Ctrl before Tab: many terminals read Ctrl+Tab as next tab.
@@ -138,6 +139,7 @@ In the pane, Tab moves between buttons, Enter presses one, the arrow keys scroll
 | --- | --- | --- | --- |
 | `minimumSightings` | 3 | 1–100 | How many times a host or write folder must recur before Sandbox Tuner offers Allow. Refusals at the network prompt stay in the counts but do not count toward it. |
 | `linkCheckMinutes` | 15 | 0–1440 | How often, in minutes, an interactive session checks again for links into the folders that Allow opened. 0 turns the timed check off. |
+| `scope` | `session` | `session`, `all` | `session`: the band, the pane, and `/sandbox-tuner` show only the hosts and write folders that the current session saw, and the Applied list shows only the edits of the current session. After `/clear` or `/branch`, the new session starts with nothing to show. After `/resume`, the session shows its own earlier sightings and edits. `all`: they show the targets and the edits of every session, as Sandbox Tuner 1.1.3 does. With both values, the counts and `minimumSightings` include the sightings of every session, and the link check covers every folder that Allow opened in any session. |
 
 Set them with `/plugin configure sandbox-tuner@sandbox-tuner`, or in `/config`.
 
@@ -188,7 +190,7 @@ Sandbox Tuner makes no network request and starts no process. Nothing leaves you
 - **Reads.** The command, its listed hosts, and its output and error output, only to find sandbox blocks. Your settings from every source (user, project, local, command line, and managed), and the text of your user settings file. The variables `HOME`, `CLAUDE_CONFIG_DIR`, and `PATH`, the working directory, the project root, and the session id. When you press Allow on a write folder, it also finds where that folder, your home folder, the config folder, the working directory, the protected places, the credentials folders (such as `~/.ssh`), and each `PATH` folder really lie. At the start of an interactive session, also after `/clear`, `/resume`, or `/branch`, and every 15 minutes during it (`linkCheckMinutes`), while a folder that Allow opened is still in your settings file, it finds where that folder, the protected places, the credentials folders, and each `PATH` folder lie. This check lists names and follows links. It opens no file. [What a write changes](docs/usage.md#what-a-write-changes) has the full list.
 - **Writes.** Sandbox Tuner writes three files itself, and only when you press Allow, Deny, or Undo: your user settings file, its backup, and the lock file next to the settings file. An edit changes one entry under `sandbox` and keeps every other key. The lock file holds only a random token of the press and a time. All other data goes to Claude Code's plugin store.
 - **The backup.** It is a full copy of your user settings file, which can hold secrets in `env`. It is created with your default file mode, which can be wider than the mode of your settings file. Sandbox Tuner uses no secret, and saves none apart from this copy.
-- **The store.** Sandbox Tuner keeps its data in Claude Code's plugin store (`$CLAUDE_CONFIG_DIR/plugins/store/`, or `~/.claude/plugins/store/` when `CLAUDE_CONFIG_DIR` is unset): hosts, ports, folder targets, one denied path for each folder, program names, session ids, counts, times, Hide choices, and the Undo journal (each entry that it added and the file it went into). It saves no command line, no output, and no other settings content.
+- **The store.** Sandbox Tuner keeps its data in Claude Code's plugin store (`$CLAUDE_CONFIG_DIR/plugins/store/`, or `~/.claude/plugins/store/` when `CLAUDE_CONFIG_DIR` is unset): hosts, ports, folder targets, one denied path for each folder, program names, session ids, counts, times, Hide choices, and the Undo journal (each entry that it added, the file it went into, and the session id of the press). It saves no command line, no output, and no other settings content.
 - **Problems.** A problem that Sandbox Tuner shows or writes to the debug log quotes only `sandbox` and `permissions` entries of your settings. When your settings file is not valid JSON, the problem shows `…` in place of the file text that the JSON parser quotes.
 
 ## Troubleshooting
@@ -196,7 +198,8 @@ Sandbox Tuner makes no network request and starts no process. Nothing leaves you
 <details>
 <summary>Missing bands, unavailable fixes, settings errors, and diagnostics</summary>
 
-- **No band.** The sandbox is off, the session runs in VS Code or the mobile app (no band there), a survey holds the band, you dismissed that block, or you already fixed it. Run `/sandbox-tuner`.
+- **No band.** The sandbox is off, the session runs in VS Code or the mobile app (no band there), a survey holds the band, you dismissed that block, or you already fixed it. With `scope: session`, `/clear`, `/resume`, and `/branch` also clear the band of the session before. Run `/sandbox-tuner`.
+- **A target or an Undo of another session is missing.** With the default `scope: session`, the band, the pane, and the report show only what the current session saw and applied. Set `scope` to `all` to show every session's targets and edits again.
 - **No Allow.** The target has not recurred enough, managed settings lock the allowlist, your settings already allow it, the folder is no cache or temp folder, or a rule of yours refuses it. The row says which.
 - **"Claude Code has not applied it yet".** Your settings file holds the entry, but the session did not load it. Run `/status` to check that the session loads user settings, and look for a ConfigChange hook that blocks the change.
 - **"Your settings already allow it", and the sandbox still blocks it.** The tool may ignore the sandbox proxy, the block may be a read, or file permissions may refuse it. Check the tool's proxy settings and supported protocols. Run `/status` or `/doctor` for managed-settings warnings.

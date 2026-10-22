@@ -41,7 +41,12 @@ export type SandboxTunerApplied = {
   undoneAt: number | null
   applyState?: 'pending'
   undoState?: 'pending' | 'retry' | 'superseded'
+  session?: string     // the session id of the press that applied it; absent when unknown, as in Sandbox Tuner 1.1.3
 }
+
+// The `scope` option: what the band, the pane, and the report show. `session`, only what the current session saw and
+// applied; `all`, what every session saw and applied.
+export type SandboxTunerScope = 'session' | 'all'
 
 export type SandboxTunerLatest = {
   recordKey: string
@@ -52,7 +57,8 @@ export type SandboxTunerLatest = {
   at: number
 }
 
-export type SandboxTunerNotice = { text: string; isError: boolean; at: number }
+// `session`: with scope session, the session id of the press that made the notice; only that session shows it.
+export type SandboxTunerNotice = { text: string; isError: boolean; at: number; session?: string }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -3,10 +3,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HookFailure, Register, RenderElement, Timer, ToolCallResult } from 'claude-code'
 
-import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, SandboxTunerRecord } from '../types'
-import { causeOf, diagnostic } from './diagnostics'
+import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
+import { KeyFailure, causeOf, diagnostic, shownCause } from './diagnostics'
 import { TMP, absolutePath, commandLine, cutText, displayPath, isTempFolder, isUnder, pathFolders, plainText } from './names'
-import { JOURNAL_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, hasLaterOwner, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, mergeSighting, recordKey, shownRecords } from './records'
+import { JOURNAL_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, mergeSighting, recordKey, seenIn, shownRecords } from './records'
 import { addEntry, fileInfo, isApplied, lockText, parseSettings, readLock, removeEntry, serializeSettings } from './settings-file'
 import type { FileInfo, ParsedSettings } from './settings-file'
 import { keepGated, latestOf, readCall, reportQuote } from './sightings'
@@ -46,9 +46,12 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
   return run
 }
 
-/** Logs a background problem and keeps it for the pane. Never rejects, so no background job ends in silence. */
-async function noteFault($: EngineInterface, text: string): Promise<void> {
-  const unshown = await update($, fault, () => text).then(
+/**
+ * Logs a background problem and keeps it for the pane, as `shown` when the pane must show it in other words. Never
+ * rejects, so no background job ends in silence.
+ */
+async function noteFault($: EngineInterface, text: string, shown = text): Promise<void> {
+  const unshown = await update($, fault, () => shown).then(
     () => '',
     (error: unknown) => ` The pane cannot show this problem: ${causeOf(error)}.`,
   )
@@ -86,25 +89,57 @@ function toOutcome(out: ToolCallResult<'Bash'>): BashOutcome {
   return { isDenied: false, isError: false, isReadOnly: out.isReadOnly === true, backgroundTaskId: out.result.backgroundTaskId, isUnsandboxed: out.result.dangerouslyDisableSandbox, text: out.text ?? '', stderr: out.result.stderr }
 }
 
-async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[], tool: string): Promise<Sighting[]> {
+/** The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it. */
+type Origin = { session: string } | { session: null; cause: string }
+
+/** Reads the session of a press or a tool call when it starts, before it waits for the call or the module queue. */
+async function sessionOrigin($: EngineInterface): Promise<Origin> {
+  try {
+    return { session: await $.session.id() }
+  } catch (error) {
+    return { session: null, cause: causeOf(error) }
+  }
+}
+
+/**
+ * What a call starts in, read before it runs with scope session: its session, and its working directory, which
+ * resolves a relative path in its output. Null when the working directory cannot be read: then the call reads it again
+ * once it ends.
+ */
+type CallStart = { origin: Origin; cwd: string | null }
+
+async function callStart($: EngineInterface): Promise<CallStart> {
+  return { origin: await sessionOrigin($), cwd: await $.session.cwd().catch(() => null) }
+}
+
+/** Keeps a problem of a call for the pane (noteFault), or only in the debug log for a call of another session. */
+async function noteCallFault($: EngineInterface, isShown: boolean, text: string, shown = text): Promise<void> {
+  if (isShown) await noteFault($, text, shown)
+  else logDebug($, text)
+}
+
+async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[], tool: string, isShown: boolean): Promise<Sighting[]> {
   try {
     return keepGated(gated, sandboxFacts(await $.settings.read()))
   } catch (error) {
-    await noteFault($, diagnostic('tool.call', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
+    await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
     return []
   }
 }
 
-async function sessionIdOf($: EngineInterface, tool: string): Promise<string | null> {
-  try {
-    return await $.session.id()
-  } catch (error) {
-    await noteFault($, diagnostic('tool.call', tool, `could not read the session id: ${causeOf(error)}`))
-    return null
-  }
+/**
+ * The session id that the sightings of a call name: with scope session, the session that ran the call (`origin`, read
+ * before the call ran), and with scope all, read now (`origin` null), as in Sandbox Tuner 1.1.3.
+ */
+async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | null, isShown: boolean): Promise<string | null> {
+  const found = origin ?? (await sessionOrigin($))
+  if (found.session !== null) return found.session
+  await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read the session id: ${found.cause}`))
+  return null
 }
 
-async function saveSighting($: EngineInterface, sighting: Sighting, sessionId: string | null, now: number, tool: string): Promise<void> {
+/** Saves one sighting. It adds the target to the targets that the pane shows only for a call of this session (`isShown`). */
+async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighting: Sighting, sessionId: string | null, now: number, tool: string, isShown: boolean): Promise<void> {
   const key = recordKey(sighting)
   try {
     const storeKey = `${WRITER_PREFIX}${writerId}:${key}`
@@ -113,18 +148,31 @@ async function saveSighting($: EngineInterface, sighting: Sighting, sessionId: s
     await $.store.set(storeKey, merged)
     const refreshed = (await readRecords($, key))[0]
     if (refreshed === undefined) throw new Error('saved evidence was not returned by the store')
-    await update($, records, list => [...list.filter(record => record.key !== key), refreshed])
+    // With scope session, a sighting with no session id names no session: it adds no target, and a load would not show it.
+    const isListed = (list: readonly SandboxTunerRecord[]) => scope === 'all' || sessionId !== null || list.some(record => record.key === key)
+    if (isShown) await update($, records, list => (isListed(list) ? [...list.filter(record => record.key !== key), refreshed] : list))
   } catch (error) {
     await update($, evidenceIncomplete, () => true)
-    await noteFault($, diagnostic('tool.call', tool, `could not save the sighting of ${key}: ${causeOf(error)}`))
+    const problem = (cause: string) => diagnostic('tool.call', tool, `could not save the sighting of ${key}: ${cause}`)
+    await noteCallFault($, isShown, problem(causeOf(error)), problem(shownCause(scope, error)))
   }
 }
 
-async function recordCall($: EngineInterface, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
+/**
+ * Records the sandbox blocks of one call. With scope session, `start` holds the session that ran it and its working
+ * directory, read before it ran. When /clear, /resume, or /branch started another session during the call, its
+ * sightings name the session that ran it, and the session now shows nothing of it: its problems go to the debug log
+ * only. A call whose session is unknown shows in no session, the same way. With scope all (`start` null), both are read
+ * once the call ends, as in Sandbox Tuner 1.1.3.
+ */
+async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: CallStart | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
   if (signal.aborted) return
   const taskId = outcome.backgroundTaskId
   if (taskId !== undefined && (await read($, backgroundTasks)).includes(taskId)) return
-  const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), await $.session.cwd())
+  const origin = start?.origin ?? null
+  const { reports, gated, unknownLine, observation, skipped } = readCall(call, outcome, await homeOf($), start?.cwd ?? (await $.session.cwd()))
+  const isQuiet = reports.length === 0 && gated.length === 0 && unknownLine === null && observation === undefined
+  const isShown = origin === null || isQuiet || (await isSessionNow($, scope, origin.session))
   // The debug log only: the pane would show a block that the command printed as a problem.
   if (skipped) logDebug($, diagnostic('tool.call', tool, 'skipped a <sandbox_violations> block that does not end the text of a failed call (not quoted: the command can print one)'))
   if (unknownLine !== null) {
@@ -132,62 +180,70 @@ async function recordCall($: EngineInterface, call: BashCall, outcome: BashOutco
     const cause = quote === null
       ? `skipped a sandbox report line of an unknown form (${unknownLine.length} characters, not quoted: it does not start like a report line)`
       : `skipped a sandbox report line of an unknown form: ${quote}`
-    await noteFault($, diagnostic('tool.call', tool, cause))
+    await noteCallFault($, isShown, diagnostic('tool.call', tool, cause))
   }
-  const sightings = gated.length === 0 ? reports : [...reports, ...(await gatedSightings($, gated, tool))]
-  if (observation !== undefined) {
+  const sightings = gated.length === 0 ? reports : [...reports, ...(await gatedSightings($, gated, tool, isShown))]
+  if (observation !== undefined && isShown) {
     const at = await $.clock.now()
     await update($, latest, () => ({ recordKey: `observation:${at}`, detail: observation.detail, reason: 'operation', reasonText: observation.operation, command: commandLine(call.command), at }))
   }
   if (taskId !== undefined) await update($, backgroundTasks, list => [...list, taskId])
   if (sightings.length === 0) return
-  const sessionId = await sessionIdOf($, tool)
+  const sessionId = await sessionIdOf($, tool, origin, isShown)
   const now = await $.clock.now()
   for (const sighting of sightings) {
     if (signal.aborted) return
-    await saveSighting($, sighting, sessionId, now, tool)
+    await saveSighting($, scope, sighting, sessionId, now, tool, isShown)
   }
   const newest = latestOf(sightings, commandLine(call.command), now)
-  if (newest !== null) await update($, latest, () => newest)
+  if (newest !== null && isShown) await update($, latest, () => newest)
 }
 
-/** Read durable evidence before displaying it or authorizing a new grant. */
-async function readRecords($: EngineInterface, targetKey?: string): Promise<SandboxTunerRecord[]> {
+/**
+ * Read durable evidence before displaying it or authorizing a new grant. With `sessionId`, only the targets that a
+ * sighting of that session named, each with the sightings of every session.
+ */
+async function readRecords($: EngineInterface, targetKey?: string, sessionId?: string): Promise<SandboxTunerRecord[]> {
   const found: SandboxTunerRecord[] = []
   for (const key of await $.store.keys()) {
     if (!key.startsWith(WRITER_PREFIX)) continue
     const writerSeparator = key.indexOf(':', WRITER_PREFIX.length)
-    if (writerSeparator <= WRITER_PREFIX.length) throw new Error(`invalid writer key: ${key}`)
+    if (writerSeparator <= WRITER_PREFIX.length) throw new KeyFailure('invalid writer key', key)
     const storedTarget = key.slice(writerSeparator + 1)
     if (targetKey !== undefined && storedTarget !== targetKey) continue
     const value = await $.store.get(key)
     if (!isRecord(value) || storedTarget !== value.key) {
-      throw new Error(`invalid saved safety evidence: ${key}`)
+      throw new KeyFailure('invalid saved safety evidence', key)
     }
     found.push(value)
   }
-  const combined = aggregateRecords(found)
+  const combined = aggregateRecords(sessionId === undefined ? found : seenIn(found, sessionId))
   for (const record of combined) {
     const hidden = await $.store.get(HIDDEN_PREFIX + record.key)
-    if (hidden !== undefined && typeof hidden !== 'boolean') throw new Error(`invalid hidden preference: ${record.key}`)
+    if (hidden !== undefined && typeof hidden !== 'boolean') throw new KeyFailure('invalid hidden preference', record.key)
     if (typeof hidden === 'boolean') record.isHidden = hidden
   }
   return combined
 }
 
-/** Display retention never deletes another writer's mutable safety evidence. */
-async function loadSaved($: EngineInterface, event: string, detail: string | null): Promise<SandboxTunerRecord[] | string> {
+/**
+ * Display retention never deletes another writer's mutable safety evidence. With scope session, the display keeps only
+ * the targets of the session that $.session.id() names now, and a problem names no saved key (shownCause). Returns the
+ * targets, or the problem as the report shows it.
+ */
+async function loadSaved($: EngineInterface, scope: SandboxTunerScope, event: string, detail: string | null): Promise<SandboxTunerRecord[] | string> {
   try {
-    const found = await readRecords($)
-    const journal = journalOf(await reconcileJournal($, await readJournal($)))
+    const found = await readRecords($, undefined, scope === 'session' ? await $.session.id() : undefined)
+    const journal = journalOf(await reconcileJournal($, scope, await readJournal($)))
     const kept = shownRecords(found, await $.clock.now())
     await update($, records, () => kept)
     await update($, applied, () => journal)
     return kept
   } catch (error) {
-    const text = diagnostic(event, detail, `could not load saved targets: ${causeOf(error)}`)
-    await noteFault($, text)
-    return text
+    const problem = (cause: string) => diagnostic(event, detail, `could not load saved targets: ${cause}`)
+    const shown = problem(shownCause(scope, error))
+    await noteFault($, problem(causeOf(error)), shown)
+    return shown
   }
 }
 
@@ -362,7 +418,7 @@ async function lockLoss($: EngineInterface, file: FileInfo, token: string): Prom
  * the change went into. The copy is `backups/settings.json.sandbox-tuner.bak` in the same folder (fileInfo). The press
  * holds the lock of the file (`token`).
  */
-async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string): Promise<PressResult | null> {
+async function writeSettings($: EngineInterface, buttonKey: string, file: FileInfo, original: string | null, text: string, entry: SandboxTunerApplied, token: string, sessionChange: SessionCheck): Promise<PressResult | null> {
   const previous = original === null ? 'The file did not exist before.' : `The previous file is saved at ${file.backupDisplay}.`
   if (original !== null) {
     try {
@@ -374,13 +430,13 @@ async function writeSettings($: EngineInterface, buttonKey: string, file: FileIn
   const pending = await saveJournal($, { buttonKey, file, entry, success: '', didWrite: false })
   if (pending.isError) return pending
   // $.fs has no conditional write: check last that no other session or program saved the file since the press read it,
-  // and that no other press took the lock over.
+  // that no other press took the lock over, and with scope session, that the session of the press is still current.
   const change = await fileText($, file.path).then(
     current => (current === original ? null : 'another program changed it'),
     (error: unknown) => causeOf(error),
   )
   const stop = change === null
-    ? await lockLoss($, file, token)
+    ? (await lockLoss($, file, token)) ?? (await sessionChange())
     : `could not confirm that ${file.display} is unchanged since Sandbox Tuner read it (${change}). Sandbox Tuner left the file as it is. Press again.`
   if (stop !== null) {
     // No settings write was attempted, so this addition cannot own an entry in the file.
@@ -490,7 +546,7 @@ async function realPlaces($: EngineInterface, paths: readonly string[], known: M
 const WALK_FOLDERS = 1000
 const WALK_ENTRIES = 25_000
 
-/** A folder that Allow opened: its entry in the settings file, how to remove it, and where it really lies. */
+/** A folder that Allow opened: its entry, the settings files that hold it, and where it really lies. */
 type Grant = Granted & { place: string }
 /** A link or guarded place, as listed, whose real place lies inside or holds folders that Allow opened: each of them. */
 type Finding = { path: string; place: string; met: { grant: Grant; isInside: boolean }[] }
@@ -618,21 +674,36 @@ async function checkRealFolder($: EngineInterface, record: SandboxTunerRecord, c
 // A warning of the check at session start names a link, a folder, and what to do: it stays long enough to read.
 const WARNING_MS = 15_000
 
+/** A folder entry that Allow added, with each settings file that still holds it. */
+type Granted = { entry: string; files: string[] }
 /**
- * A folder entry that Allow added and that a settings file still holds: whether a row of the pane can undo it, and each
- * settings file that holds it with no such row, where only a hand edit removes it.
+ * Where the warning about a folder entry sends the person: whether a row of the pane can undo it, and each settings
+ * file that holds it with no such row, where only a hand edit removes it.
  */
-type Granted = { entry: string; hasUndo: boolean; byHand: string[] }
+type Advice = { hasUndo: boolean; byHand: string[] }
 
 /**
- * The entries of the folders that Allow opened that their settings file still holds. The file decides, whatever the
- * journal says: an unconfirmed addition, an Undo that failed or is unconfirmed, or an entry marked undone that is back.
+ * The rows of the Applied list, as the pane shows them: with scope session, only the edits of the current session. The
+ * pane cannot draw that list without the session id, so then no row has an Undo, and each warning names the file.
  */
-async function grantedEntries($: EngineInterface): Promise<Granted[]> {
-  const journal = await readJournal($)
-  // The rows of the Applied list, as the pane shows them.
-  const listed = new Set(journalOf(journal))
-  const granted = new Map<string, { held: Set<string>; undoable: Set<string> }>()
+async function listedRows($: EngineInterface, scope: SandboxTunerScope, event: RecheckEvent, journal: readonly SandboxTunerApplied[]): Promise<SandboxTunerApplied[]> {
+  const rows = journalOf(journal)
+  if (scope === 'all') return rows
+  try {
+    return appliedIn(rows, await $.session.id())
+  } catch (error) {
+    logDebug($, diagnostic(event, null, `could not read the session id, so each warning names the settings file to edit: ${causeOf(error)}`))
+    return []
+  }
+}
+
+/**
+ * The entries of the folders that Allow opened in any session that their settings file still holds. The file decides,
+ * whatever the journal says: an unconfirmed addition, an Undo that failed or is unconfirmed, or an entry marked undone
+ * that is back.
+ */
+async function grantedEntries($: EngineInterface, journal: readonly SandboxTunerApplied[]): Promise<Granted[]> {
+  const granted = new Map<string, Set<string>>()
   const values = new Map<string, Record<string, unknown> | null>()
   for (const entry of journal) {
     if (entry.settingsKey !== 'sandbox.filesystem.allowWrite') continue
@@ -642,13 +713,36 @@ async function grantedEntries($: EngineInterface): Promise<Granted[]> {
     }
     const value = values.get(entry.file)
     if (value === undefined || value === null || !('isPresent' in addEntry(value, entry.settingsKey, entry.entry))) continue
-    const files = granted.get(entry.entry) ?? { held: new Set<string>(), undoable: new Set<string>() }
+    const files = granted.get(entry.entry) ?? new Set<string>()
     granted.set(entry.entry, files)
-    files.held.add(entry.file)
-    // A row with an Undo button whose press does not refuse: Undo refuses an entry that a later change owns.
-    if (listed.has(entry) && canUndo(entry) && !hasLaterOwner(journal, entry)) files.undoable.add(entry.file)
+    files.add(entry.file)
   }
-  return [...granted].map(([entry, { held, undoable }]) => ({ entry, hasUndo: undoable.size > 0, byHand: [...held].filter(file => !undoable.has(file)) }))
+  return [...granted].map(([entry, files]) => ({ entry, files: [...files] }))
+}
+
+/**
+ * The advice of each warning, as the pane shows the Applied list when the walk ends. With scope session, it reads the
+ * journal and the session id again: /clear, /resume, or /branch can start a session with other rows during the walk.
+ * With scope all, the journal of the start of the check decides, as in Sandbox Tuner 1.1.3.
+ */
+async function adviceOf($: EngineInterface, scope: SandboxTunerScope, event: RecheckEvent, journal: readonly SandboxTunerApplied[], granted: readonly Granted[]): Promise<Map<string, Advice>> {
+  let rows = journal
+  if (scope === 'session') {
+    try {
+      rows = await readJournal($)
+    } catch (error) {
+      logDebug($, diagnostic(event, null, `could not read the Undo journal again, so each warning names the settings file to edit: ${causeOf(error)}`))
+      rows = []
+    }
+  }
+  const listed = new Set(await listedRows($, scope, event, rows))
+  const advice = new Map<string, Advice>()
+  for (const { entry, files } of granted) {
+    // A row with an Undo button whose press does not refuse: Undo refuses an entry that a later change owns.
+    const undoable = new Set(rows.filter(row => row.settingsKey === 'sandbox.filesystem.allowWrite' && row.entry === entry && files.includes(row.file) && listed.has(row) && canUndo(row) && !hasLaterOwner(rows, row)).map(row => row.file))
+    advice.set(entry, { hasUndo: undoable.size > 0, byHand: files.filter(file => !undoable.has(file)) })
+  }
+  return advice
 }
 
 /** The event that a check reports with: a check at a session start, or a timed check during the session. */
@@ -666,11 +760,13 @@ type Warnings = { skip: readonly ReadonlySet<string>[]; shown: Set<string>; foun
  * one, gives one toast, unless `warnings.skip` holds it. It warns and writes nothing. It runs outside the queue, so that
  * its walk never holds back the recording of a Bash call. It never rejects: the hook and the timer drop what it returns.
  */
-async function recheckGrants($: EngineInterface, threshold: number, event: RecheckEvent, warnings: Warnings): Promise<void> {
+async function recheckGrants($: EngineInterface, threshold: number, scope: SandboxTunerScope, event: RecheckEvent, warnings: Warnings): Promise<void> {
+  let journal: SandboxTunerApplied[]
   let entries: Granted[]
   let context: Context
   try {
-    entries = await grantedEntries($)
+    journal = await readJournal($)
+    entries = await grantedEntries($, journal)
     if (entries.length === 0) return
     context = await loadContext($, threshold, event)
   } catch (error) {
@@ -697,11 +793,16 @@ async function recheckGrants($: EngineInterface, threshold: number, event: Reche
     }
   }
   const display = (path: string) => displayPath(path, context.home)
+  // Read when the walk ends, right before the toasts (adviceOf).
+  const advice = recheck.found.length === 0 ? new Map<string, Advice>() : await adviceOf($, scope, event, journal, entries)
   const warned = new Set<string>()
   for (const { path, place, met } of recheck.found) {
     if (warned.has(path)) continue
     warned.add(path)
-    const grants = met.map(({ grant, isInside }) => ({ grant: grant.entry, isInside, hasUndo: grant.hasUndo, byHand: grant.byHand.map(file => fileInfo(file, context.home).display) }))
+    const grants = met.map(({ grant, isInside }) => {
+      const { hasUndo, byHand } = advice.get(grant.entry) ?? { hasUndo: false, byHand: grant.files }
+      return { grant: grant.entry, isInside, hasUndo, byHand: byHand.map(file => fileInfo(file, context.home).display) }
+    })
     const warning = grantWarning(display(path), display(place), grants)
     const isWarned = warnings.skip.some(skipped => skipped.has(warning))
     warnings.found.add(warning)
@@ -738,7 +839,7 @@ let startWarnings = new Set<string>()
  * session was not warned about since its start, and a session start that a timed request follows before its turn still
  * gets its check. It never rejects.
  */
-async function recheckOnce($: EngineInterface, threshold: number, isStart: boolean): Promise<void> {
+async function recheckOnce($: EngineInterface, threshold: number, scope: SandboxTunerScope, isStart: boolean): Promise<void> {
   newestRecheck += 1
   const request = newestRecheck
   if (isStart) isStartPending = true
@@ -748,7 +849,7 @@ async function recheckOnce($: EngineInterface, threshold: number, isStart: boole
     isStartPending = false
     if (isStartCheck) startWarnings = new Set()
     const skip = isStartCheck ? [shownWarnings] : [shownWarnings, startWarnings]
-    await recheckGrants($, threshold, isStartCheck ? 'session.start' : 'clock.every', { skip, shown: shownWarnings, found: startWarnings })
+    await recheckGrants($, threshold, scope, isStartCheck ? 'session.start' : 'clock.every', { skip, shown: shownWarnings, found: startWarnings })
   }
   const check = lastRecheck.then(run, run)
   lastRecheck = check
@@ -764,7 +865,8 @@ function changeFor(verdict: Verdict, action: SandboxTunerAction): Change | null 
   return 'deny' in verdict ? verdict.deny : null
 }
 
-type AddEdit = { kind: 'add'; record: SandboxTunerRecord; action: SandboxTunerAction; context: Context }
+// `session`: the session id that the journal entry keeps, undefined when the press could not read it (pressSession).
+type AddEdit = { kind: 'add'; record: SandboxTunerRecord; action: SandboxTunerAction; context: Context; session: string | undefined }
 type RemoveEdit = { kind: 'remove'; entry: SandboxTunerApplied }
 type SettingsEdit = AddEdit | RemoveEdit
 
@@ -824,6 +926,7 @@ async function planEdit($: EngineInterface, buttonKey: string, file: FileInfo, e
       appliedAt,
       undoneAt: null,
       applyState: 'pending',
+      ...(edit.session === undefined ? {} : { session: edit.session }),
     }
     return { edit, change, loaded, value: added.value, entry, success: addedNotice(change, loaded.original !== null) }
   }
@@ -889,7 +992,7 @@ async function refitEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * holds now, and writes it. An addition gets a time later than each change of its entry that the journal holds now, as
  * a press of another session can have saved one while this press waited for the lock.
  */
-async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string): Promise<PressResult> {
+async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, first: Planned, token: string, sessionChange: SessionCheck): Promise<PressResult> {
   const checked = await recheckPlan($, buttonKey, first)
   if (!('value' in checked)) return checked
   const read = await readText($, file, buttonKey)
@@ -898,7 +1001,7 @@ async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
   if (!('value' in planned)) return planned
   const { loaded, value, success } = planned
   const entry = 'change' in planned ? { ...planned.entry, appliedAt: laterThanJournal(await readJournal($), file, planned.change, planned.entry.appliedAt) } : planned.entry
-  const problem = await writeSettings($, buttonKey, file, loaded.original, serializeSettings(value, loaded.parsed), entry, token)
+  const problem = await writeSettings($, buttonKey, file, loaded.original, serializeSettings(value, loaded.parsed), entry, token, sessionChange)
   if (problem !== null) return problem
   return saveJournal($, { buttonKey, file, entry: { ...entry, applyState: undefined }, success, didWrite: true })
 }
@@ -909,7 +1012,7 @@ async function writeEdit($: EngineInterface, buttonKey: string, file: FileInfo, 
  * under the lock, the checks of the file run again when the text changed between the reads, and the unchanged-file
  * check right before the write compares with the second read.
  */
-async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit): Promise<PressResult> {
+async function editSettings($: EngineInterface, buttonKey: string, file: FileInfo, edit: SettingsEdit, sessionChange: SessionCheck): Promise<PressResult> {
   const loaded = await readSettingsFile($, file, buttonKey)
   if (!('parsed' in loaded)) return loaded
   const planned = await planEdit($, buttonKey, file, edit, loaded)
@@ -917,7 +1020,7 @@ async function editSettings($: EngineInterface, buttonKey: string, file: FileInf
   const token = await takeLock($, file, buttonKey)
   if (typeof token !== 'string') return token
   try {
-    return await writeEdit($, buttonKey, file, planned, token)
+    return await writeEdit($, buttonKey, file, planned, token, sessionChange)
   } finally {
     await freeLock($, file, token, buttonKey)
   }
@@ -929,7 +1032,36 @@ async function targetRecord($: EngineInterface, key: string, buttonKey: string):
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
 
-async function applyFix($: EngineInterface, threshold: number, key: string, action: SandboxTunerAction, buttonKey: string): Promise<PressResult> {
+/** Why a press stops right before its settings write, or null when it goes on (pressStop). */
+type SessionCheck = () => Promise<string | null>
+
+/**
+ * Why a press of session `origin` does not run now, or null when it runs. With scope session, a press runs only in the
+ * session where it was pressed: /clear, /resume, or /branch can start another session while the press waits in the
+ * module queue, or during its reads before the settings write. With scope all, every press runs, as in 1.1.3.
+ */
+async function pressStop($: EngineInterface, scope: SandboxTunerScope, origin: Origin): Promise<string | null> {
+  if (scope === 'all') return null
+  if (origin.session === null) return `could not read the session id: ${origin.cause}. Nothing was written.`
+  try {
+    return (await $.session.id()) === origin.session ? null : 'another session started after this press. Nothing was written.'
+  } catch (error) {
+    return `could not read the session id: ${causeOf(error)}. Nothing was written.`
+  }
+}
+
+/**
+ * The session id that the journal entry of a press keeps: the session of the press (`origin`), also when /clear,
+ * /resume, or /branch started another session while the press waited. With scope all, a press whose session is unknown
+ * goes on and its entry names no session, as in Sandbox Tuner 1.1.3. With scope session, it stops: the Applied list of
+ * the session would not show its Undo. (pressStop already stops such a press in the module queue.)
+ */
+function pressSession(scope: SandboxTunerScope, buttonKey: string, origin: Origin): { session: string | undefined } | PressResult {
+  if (origin.session !== null) return { session: origin.session }
+  return scope === 'all' ? { session: undefined } : failure(buttonKey, `could not read the session id: ${origin.cause}. Nothing was written.`)
+}
+
+async function applyFix($: EngineInterface, threshold: number, scope: SandboxTunerScope, key: string, action: SandboxTunerAction, buttonKey: string, origin: Origin): Promise<PressResult> {
   let context: Context
   try {
     context = await loadContext($, threshold, `ui.press (${buttonKey})`)
@@ -939,12 +1071,14 @@ async function applyFix($: EngineInterface, threshold: number, key: string, acti
   const record = await targetRecord($, key, buttonKey)
   if (!('key' in record)) return record
   if (context.file === undefined) return info(nothingApplied(verdictSentences(record, verdictOf(record, context), context)))
-  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context })
+  const pressed = pressSession(scope, buttonKey, origin)
+  if (!('session' in pressed)) return pressed
+  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context, session: pressed.session }, () => pressStop($, scope, origin))
 }
 
-async function openPress($: EngineInterface): Promise<PressResult | null> {
+async function openPress($: EngineInterface, scope: SandboxTunerScope): Promise<PressResult | null> {
   try {
-    await loadSaved($, 'ui.press', 'band-open')
+    await loadSaved($, scope, 'ui.press', 'band-open')
     const opened = await $.ui.open(PANE_OPEN)
     // A surface that places no panes keeps the pane open but undrawn: say why, or the press seems to do nothing.
     return opened.isPlaced ? null : failure('band-open', `the pane is not placed: ${opened.reason}`)
@@ -959,16 +1093,63 @@ async function dismissPress($: EngineInterface, key: string): Promise<null> {
 }
 
 /**
+ * Loads the saved targets for a session that /clear, /resume, or /branch started in this process. With scope session,
+ * nothing of the session before stays first: not its targets, so that a load that fails shows none, its band, its
+ * notice, its dismissal, its last background problem, which can name its targets, or the place in its Applied list.
+ */
+async function startSession($: EngineInterface, scope: SandboxTunerScope): Promise<void> {
+  if (scope === 'session') {
+    const clears: (() => Promise<unknown>)[] = [
+      () => update($, records, () => []),
+      () => update($, latest, () => null),
+      () => update($, notice, () => null),
+      () => update($, dismissed, () => null),
+      () => update($, appliedOffset, () => 0),
+      () => update($, fault, () => null),
+    ]
+    // Each clear that fails leaves the others to run.
+    const problems: string[] = []
+    for (const clear of clears) await clear().catch((error: unknown) => problems.push(causeOf(error)))
+    if (problems.length > 0) await noteFault($, diagnostic('classic.SessionStart', null, `could not clear what the session before showed: ${problems.join('; ')}`))
+  }
+  await loadSaved($, scope, 'classic.SessionStart', null)
+}
+
+/**
+ * Whether a notice or a toast of a press of `session` shows now. With scope session, only in that session: /clear,
+ * /resume, or /branch can start another session while the press waits or before its check after the write. A press
+ * whose session is unknown shows them in no session, and so does a current session whose id cannot be read. With
+ * scope all, they show in every session, as in Sandbox Tuner 1.1.3.
+ */
+async function isSessionNow($: EngineInterface, scope: SandboxTunerScope, session: string | null | undefined): Promise<boolean> {
+  if (scope === 'all') return true
+  if (session === null || session === undefined) return false
+  try {
+    return (await $.session.id()) === session
+  } catch {
+    return false
+  }
+}
+
+/** The notice that the band and the pane show: with scope session, one of a press of the current session. */
+async function noticeNow($: EngineInterface, scope: SandboxTunerScope): Promise<SandboxTunerNotice | null> {
+  const last = await read($, notice)
+  return last === null || (await isSessionNow($, scope, last.session)) ? last : null
+}
+
+/**
  * After a write has settled, checks that the entry is still as the press left it, then draws the band and the pane
  * again with the settings that Claude Code applied. $.fs has no conditional write, so another session that saved the
- * file at the same moment can have taken the change back. It never rejects: a timer drops what its function returns.
+ * file at the same moment can have taken the change back. With scope session, a problem shows only in the session of
+ * the press (`origin`, null when unknown), and the debug log keeps it. It never rejects: a timer drops what its function
+ * returns.
  */
-async function confirmChange($: EngineInterface, buttonKey: string, written: Written): Promise<void> {
+async function confirmChange($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, written: Written, origin: string | null): Promise<void> {
   const { file, entry } = written
   try {
     let journal = await readJournal($)
     if (isPressedAgain(journal, entry)) return
-    journal = await reconcileJournal($, journal)
+    journal = await reconcileJournal($, scope, journal)
     const parsed = parseSettings((await fileText($, file.path)) ?? '')
     const probe = 'refusal' in parsed ? parsed : addEntry(parsed.value, entry.settingsKey, entry.entry)
     const isAdded = entry.undoneAt === null
@@ -987,10 +1168,12 @@ async function confirmChange($: EngineInterface, buttonKey: string, written: Wri
     if (problem !== null) {
       const text = diagnostic('ui.press', buttonKey, problem)
       logDebug($, text)
-      // A toast reaches the person whatever is open: after a band press, the band hides once the change is in the journal.
-      $.ui.toast(drawable(hostText(text)))
-      const now = await $.clock.now()
-      await update($, notice, () => ({ text, isError: true, at: now }))
+      if (await isSessionNow($, scope, origin)) {
+        // A toast reaches the person whatever is open: after a band press, the band hides once the change is in the journal.
+        $.ui.toast(drawable(hostText(text)))
+        const now = await $.clock.now()
+        await update($, notice, () => ({ text, isError: true, at: now, ...(scope === 'all' || origin === null ? {} : { session: origin }) }))
+      }
     }
   } catch (error) {
     logDebug($, diagnostic('ui.press', buttonKey, `could not check ${file.display} after the write: ${causeOf(error)}`))
@@ -998,19 +1181,38 @@ async function confirmChange($: EngineInterface, buttonKey: string, written: Wri
   $.ui.invalidate('ui.render')
 }
 
-/** Runs one press in the module queue and shows its result. It never rejects: a Button drops what onPress returns. */
-async function runPress($: EngineInterface, buttonKey: string, action: () => Promise<PressResult | null>): Promise<void> {
-  const result = await enqueue(() => action().catch((error: unknown) => failure(buttonKey, causeOf(error))))
+/**
+ * Runs one press in the module queue, with the session of the press (sessionOrigin), and shows its result: with scope
+ * session, it runs and shows only in that session (pressStop, isSessionNow). It never rejects: a Button drops what
+ * onPress returns.
+ */
+async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>): Promise<void> {
+  const origin = await sessionOrigin($)
+  const result = await enqueue(async () => {
+    const stop = await pressStop($, scope, origin)
+    if (stop !== null) {
+      logDebug($, diagnostic('ui.press', buttonKey, stop))
+      return null
+    }
+    return action(origin).catch((error: unknown) => {
+      const cause = shownCause(scope, error)
+      // The debug log keeps the cause that the band and the pane leave out.
+      if (cause !== causeOf(error)) logDebug($, diagnostic('ui.press', buttonKey, causeOf(error)))
+      return failure(buttonKey, cause)
+    })
+  })
   if (result === null) return
   if (result.isError) logDebug($, result.text)
+  const isShown = await isSessionNow($, scope, origin.session)
   const { written } = result
   if (written !== null) {
-    $.ui.toast(drawable(hostText(result.text)))
-    $.clock.after(REDRAW_AFTER_WRITE_MS, () => void enqueue(() => confirmChange($, buttonKey, written)))
+    if (isShown) $.ui.toast(drawable(hostText(result.text)))
+    $.clock.after(REDRAW_AFTER_WRITE_MS, () => void enqueue(() => confirmChange($, scope, buttonKey, written, origin.session)))
   }
+  if (!isShown) return
   try {
     const now = await $.clock.now()
-    await update($, notice, () => ({ text: result.text, isError: result.isError, at: now }))
+    await update($, notice, () => ({ text: result.text, isError: result.isError, at: now, ...(scope === 'all' || origin.session === null ? {} : { session: origin.session }) }))
   } catch (error) {
     logDebug($, diagnostic('ui.press', buttonKey, `could not show the notice "${result.text}": ${causeOf(error)}`))
   }
@@ -1021,15 +1223,20 @@ async function readJournal($: EngineInterface): Promise<SandboxTunerApplied[]> {
   for (const key of await $.store.keys()) {
     if (!key.startsWith(JOURNAL_PREFIX)) continue
     const entry = await $.store.get(key)
-    if (!isApplied(entry) || JOURNAL_PREFIX + entry.id !== key) throw new Error(`invalid Undo journal entry: ${key}`)
+    if (!isApplied(entry) || JOURNAL_PREFIX + entry.id !== key) throw new KeyFailure('invalid Undo journal entry', key)
     journal.push(entry)
   }
   return journal
 }
 
-/** Reconcile uncertain edits without writing settings, including after a reload. */
-async function reconcileJournal($: EngineInterface, journal: readonly SandboxTunerApplied[]): Promise<SandboxTunerApplied[]> {
+/**
+ * Reconcile uncertain edits without writing settings, including after a reload. With scope session, the pane shows the
+ * problem with a change of another session in general words, and the debug log names the change.
+ */
+async function reconcileJournal($: EngineInterface, scope: SandboxTunerScope, journal: readonly SandboxTunerApplied[]): Promise<SandboxTunerApplied[]> {
   const reconciled: SandboxTunerApplied[] = []
+  // The current session, read at the first problem: null when it cannot be read.
+  let current: string | null | undefined
   for (const entry of journal) {
     const isAddition = entry.applyState === 'pending'
     if (!isAddition && !isUndoUnresolved(entry)) { reconciled.push(entry); continue }
@@ -1042,7 +1249,11 @@ async function reconcileJournal($: EngineInterface, journal: readonly SandboxTun
         if ('refusal' in probe) throw new Error(verificationRefusalText(probe, fileInfo(entry.file, await homeOf($))))
         if (isAddition ? 'isPresent' in probe : !('isPresent' in probe)) next = { ...entry, applyState: undefined, undoState: undefined }
       } catch (error) {
-        await noteFault($, diagnostic(isAddition ? 'apply.confirm' : 'undo.confirm', entry.id, causeOf(error)))
+        const event = isAddition ? 'apply.confirm' : 'undo.confirm'
+        const text = diagnostic(event, entry.id, causeOf(error))
+        if (scope === 'session' && current === undefined) current = await $.session.id().catch(() => null)
+        const isShown = scope === 'all' || (current !== null && entry.session === current)
+        await noteFault($, text, isShown ? text : diagnostic(event, null, `could not confirm ${isAddition ? 'an addition' : 'an Undo'} that another session made. The debug log names it and the cause.`))
       }
     }
     await $.store.set(JOURNAL_PREFIX + entry.id, next)
@@ -1061,15 +1272,21 @@ function undoable(journal: readonly SandboxTunerApplied[], id: string, buttonKey
   return hasLaterOwner(journal, entry) ? failure(buttonKey, 'a later journal entry owns this setting. Nothing was written. Reopen the pane.') : entry
 }
 
-async function undoFix($: EngineInterface, id: string, buttonKey: string): Promise<PressResult> {
+async function undoFix($: EngineInterface, scope: SandboxTunerScope, id: string, buttonKey: string, origin: Origin): Promise<PressResult> {
   const entry = undoable(await readJournal($), id, buttonKey)
   if (!('id' in entry)) return entry
   const file = fileInfo(entry.file, await homeOf($))
-  return editSettings($, buttonKey, file, { kind: 'remove', entry })
+  return editSettings($, buttonKey, file, { kind: 'remove', entry }, () => pressStop($, scope, origin))
 }
 
-async function moveApplied($: EngineInterface, delta: number): Promise<null> {
-  const last = Math.max(0, (await read($, applied)).length - 1)
+/** The rows of the Applied list: with scope session, only the edits that a press of the current session saved. */
+async function shownJournal($: EngineInterface, scope: SandboxTunerScope): Promise<SandboxTunerApplied[]> {
+  const journal = await read($, applied)
+  return scope === 'all' ? journal : appliedIn(journal, await $.session.id())
+}
+
+async function moveApplied($: EngineInterface, scope: SandboxTunerScope, delta: number): Promise<null> {
+  const last = Math.max(0, (await shownJournal($, scope)).length - 1)
   await update($, appliedOffset, offset => Math.max(0, Math.min(last, Math.min(offset, last) + delta)))
   return null
 }
@@ -1090,6 +1307,8 @@ async function setHidden($: EngineInterface, key: string, isHidden: boolean, but
 
 export const register: Register = (on, options) => {
   const threshold = Number(options.minimumSightings)
+  // What the band, the pane, and the report show: the current session's targets and edits, or every session's.
+  const scope: SandboxTunerScope = options.scope === 'all' ? 'all' : 'session'
   // How often an interactive session checks the folders that Allow opened again. 0 turns the timed check off.
   const linkCheckMs = Number(options.linkCheckMinutes) * 60_000
   // Whether a person is at the prompt. Only session.start says so, and the process keeps it across /clear.
@@ -1105,11 +1324,11 @@ export const register: Register = (on, options) => {
     } catch (error) {
       await noteFault($, diagnostic('session.start', null, `could not register /sandbox-tuner: ${causeOf(error)}`))
     }
-    void enqueue(() => loadSaved($, 'session.start', null))
+    void enqueue(() => loadSaved($, scope, 'session.start', null))
     // Outside the queue: its walk must not hold back the recording of the first Bash calls.
-    if (e.isInteractive) void recheckOnce($, threshold, true)
+    if (e.isInteractive) void recheckOnce($, threshold, scope, true)
     // A link made during the session: the check at its start cannot see it.
-    if (e.isInteractive && linkTimer === null && linkCheckMs > 0) linkTimer = $.clock.every(linkCheckMs, () => void recheckOnce($, threshold, false))
+    if (e.isInteractive && linkTimer === null && linkCheckMs > 0) linkTimer = $.clock.every(linkCheckMs, () => void recheckOnce($, threshold, scope, false))
     return started
   }).catch(($, e, next) => {
     hookFailed($, 'session.start', null, next.error)
@@ -1118,8 +1337,8 @@ export const register: Register = (on, options) => {
 
   // /clear, /resume, and /branch start a new session in the same process, and session.start does not fire.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    await enqueue(() => loadSaved($, 'classic.SessionStart', null))
-    if (isInteractive) void recheckOnce($, threshold, true)
+    await enqueue(() => startSession($, scope))
+    if (isInteractive) void recheckOnce($, threshold, scope, true)
     return next(e)
   }).catch(($, e, next) => {
     hookFailed($, 'classic.SessionStart', null, next.error)
@@ -1127,9 +1346,12 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // With scope session, the session and the working directory of the call, read before it runs: /clear, /resume, or
+    // /branch can start another session while it runs.
+    const start = scope === 'session' ? await callStart($) : null
     const out = await next(e)
     // The wait for the queue counts as this hook's own time, so the job stops once the dispatch is abandoned.
-    if (!next.signal.aborted) await enqueue(() => recordCall($, toCall(e), toOutcome(out), next.signal))
+    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, start, toCall(e), toOutcome(out), next.signal))
     return out
   }).catch(($, e, next) => {
     hookFailed($, 'tool.call', 'Bash', next.error)
@@ -1137,9 +1359,10 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
+    const start = scope === 'session' ? await callStart($) : null
     const out = await next(e)
     if (!next.signal.aborted && e.command !== undefined && e.ws === undefined && out.deny === undefined && out.isError !== true && out.result.taskId !== '') {
-      await enqueue(() => recordCall($, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
+      await enqueue(() => recordCall($, scope, start, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
         { isDenied: false, isError: false, backgroundTaskId: out.result.taskId, text: '', stderr: '' }, next.signal, 'Monitor'))
     }
     return out
@@ -1153,22 +1376,22 @@ export const register: Register = (on, options) => {
     if (e.props.hasSurvey || last === null) return next(e)
     if (last.reason === 'operation') {
       if ((await read($, dismissed)) === last.recordKey) return next(e)
-      return bandTree($.ui.resolve(e), buildObservation(last, await read($, notice)), {
+      return bandTree($.ui.resolve(e), buildObservation(last, await noticeNow($, scope)), {
         allow: () => {}, deny: () => {},
-        open: () => void runPress($, 'band-open', () => openPress($)),
-        dismiss: () => void runPress($, 'band-dismiss', () => dismissPress($, last.recordKey)),
+        open: () => void runPress($, scope, 'band-open', () => openPress($, scope)),
+        dismiss: () => void runPress($, scope, 'band-dismiss', () => dismissPress($, last.recordKey)),
       }, await next(e), e.props.bodyColumns)
     }
     const record = (await read($, records)).find(item => item.key === last.recordKey)
     if (record === undefined || record.isHidden || (await read($, dismissed)) === last.recordKey || isFixedSince(await read($, applied), last)) return next(e)
     const context = await loadContext($, threshold, 'ui.render (AbovePrompt)')
-    const model = buildBand(last, record, verdictOf(record, context), context, await read($, notice))
+    const model = buildBand(last, record, verdictOf(record, context), context, await noticeNow($, scope))
     const beneath: RenderElement = await next(e)
     return bandTree($.ui.resolve(e), model, {
-      allow: () => void runPress($, 'band-allow', () => applyFix($, threshold, record.key, 'allow', 'band-allow')),
-      deny: () => void runPress($, 'band-deny', () => applyFix($, threshold, record.key, 'deny', 'band-deny')),
-      open: () => void runPress($, 'band-open', () => openPress($)),
-      dismiss: () => void runPress($, 'band-dismiss', () => dismissPress($, record.key)),
+      allow: () => void runPress($, scope, 'band-allow', origin => applyFix($, threshold, scope, record.key, 'allow', 'band-allow', origin)),
+      deny: () => void runPress($, scope, 'band-deny', origin => applyFix($, threshold, scope, record.key, 'deny', 'band-deny', origin)),
+      open: () => void runPress($, scope, 'band-open', () => openPress($, scope)),
+      dismiss: () => void runPress($, scope, 'band-dismiss', () => dismissPress($, record.key)),
     }, beneath, e.props.bodyColumns)
   }).catch(($, e, next) => {
     hookFailed($, 'ui.render', 'AbovePrompt', next.error)
@@ -1177,7 +1400,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const context = await loadContext($, threshold, 'ui.render (Pane)')
-    const journal = await read($, applied)
+    const journal = await shownJournal($, scope)
     const now = await $.clock.now()
     const model = buildPane({
       // Sightings of this session join $.state without a load, so each drawing applies the display limits again.
@@ -1185,19 +1408,20 @@ export const register: Register = (on, options) => {
       applied: journal,
       reformatted: await reformattedFiles($, journal, context),
       appliedOffset: await read($, appliedOffset),
-      notice: await read($, notice),
+      notice: await noticeNow($, scope),
       fault: await read($, fault),
       isSandboxOn: sandboxFacts(await $.settings.read()).isEnabled,
       context,
       now,
+      scope,
     })
     return paneTree($.ui.resolve(e), model, {
-      allow: key => void runPress($, `allow:${key}`, () => applyFix($, threshold, key, 'allow', `allow:${key}`)),
-      deny: key => void runPress($, `deny:${key}`, () => applyFix($, threshold, key, 'deny', `deny:${key}`)),
-      hide: key => void runPress($, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
-      unhide: key => void runPress($, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),
-      undo: id => void runPress($, `undo:${id}`, () => undoFix($, id, `undo:${id}`)),
-      moveApplied: delta => void runPress($, delta < 0 ? 'applied-previous' : 'applied-next', () => moveApplied($, delta)),
+      allow: key => void runPress($, scope, `allow:${key}`, origin => applyFix($, threshold, scope, key, 'allow', `allow:${key}`, origin)),
+      deny: key => void runPress($, scope, `deny:${key}`, origin => applyFix($, threshold, scope, key, 'deny', `deny:${key}`, origin)),
+      hide: key => void runPress($, scope, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
+      unhide: key => void runPress($, scope, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),
+      undo: id => void runPress($, scope, `undo:${id}`, origin => undoFix($, scope, id, `undo:${id}`, origin)),
+      moveApplied: delta => void runPress($, scope, delta < 0 ? 'applied-previous' : 'applied-next', () => moveApplied($, scope, delta)),
     })
   }).catch(($, e, next) => {
     const text = hookFailed($, 'ui.render', 'Pane', next.error)
@@ -1206,13 +1430,13 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'sandbox-tuner' }, async $ => {
-    const loaded = await enqueue(() => loadSaved($, 'command.run', '/sandbox-tuner'))
+    const loaded = await enqueue(() => loadSaved($, scope, 'command.run', '/sandbox-tuner'))
     const prefix = typeof loaded === 'string' ? `${loaded}\n\n` : ''
     const context = await loadContext($, threshold, 'command.run (/sandbox-tuner)')
     // One dispatch reads $.state at one moment, so rate the records that the load returned.
     const now = await $.clock.now()
     const rated = rateRecords(typeof loaded === 'string' ? shownRecords(await read($, records), now) : loaded, context)
-    const report = reportText(rated, context, sandboxFacts(await $.settings.read()).isEnabled, now)
+    const report = reportText(rated, context, sandboxFacts(await $.settings.read()).isEnabled, now, scope)
     // A cause from the engine can hold characters that a transcript row must not show.
     if ((await $.session.surfaces()).length === 0) return { text: hostText(plainText(`${prefix}${report}`)) }
     try {

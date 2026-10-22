@@ -1,6 +1,6 @@
 // The sentences of the band, the pane, the report, the command, and the notices.
 
-import type { SandboxTunerApplied, SandboxTunerLatest, SandboxTunerRecord, SandboxTunerSettingsKey } from '../types'
+import type { SandboxTunerApplied, SandboxTunerLatest, SandboxTunerRecord, SandboxTunerScope, SandboxTunerSettingsKey } from '../types'
 import { cutText, displayPath, isSharedFolder, plainText } from './names'
 import { allowCount, sightingTotal } from './records'
 import type { FileInfo, Refusal } from './settings-file'
@@ -12,7 +12,10 @@ const QUOTE_LIMIT = 200
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 
-export const NO_BLOCKS = 'Sandbox Tuner has not seen a sandbox block yet.'
+export const NO_BLOCKS: Readonly<Record<SandboxTunerScope, string>> = {
+  session: 'Sandbox Tuner has not seen a sandbox block in this session yet.',
+  all: 'Sandbox Tuner has not seen a sandbox block yet.',
+}
 export const SANDBOX_OFF = 'The sandbox is off in this session. Sandbox Tuner has nothing to tune.'
 const NO_SETTINGS_FILE = 'Sandbox Tuner cannot find your user settings file because HOME and CLAUDE_CONFIG_DIR are not set.'
 export const NOTHING_TO_UNDO = 'Nothing to undo.'
