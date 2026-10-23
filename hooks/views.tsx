@@ -103,6 +103,8 @@ const SECTIONS = [
   { kind: 'host', title: 'Hosts' },
   { kind: 'path', title: 'Write folders' },
 ] as const
+// The heading of the targets that have no fix: no settings fix, or a target that the settings already allow.
+const NOTHING_TO_ALLOW = 'Nothing to allow here'
 
 type RecordRow = { key: string; target: string; summary: string; sentences: string[]; canAllow: boolean; canDeny: boolean; canHide: boolean }
 type PaneSection = { title: string; rows: RecordRow[] }
@@ -116,6 +118,23 @@ type PaneActions = { allow: (key: string) => void; deny: (key: string) => void; 
 
 function visible(rated: readonly Rated[]): Rated[] {
   return rated.filter(({ record }) => !record.isHidden)
+}
+
+/** A target with a fix: Allow now or after more sightings, or Deny. */
+function hasFix({ verdict }: Rated): boolean {
+  return verdict.status === 'ready' || verdict.status === 'waiting'
+}
+
+/**
+ * The lists of shown targets in the pane and the report: the hosts, then the write folders, that have a fix, then every
+ * target with no fix under one heading, hosts first. Each list keeps the ranked order.
+ */
+function targetLists(shown: readonly Rated[]): { title: string; rows: Rated[] }[] {
+  const ofKind = (kind: SandboxTunerRecord['kind'], isFixable: boolean) => shown.filter(rated => rated.record.kind === kind && hasFix(rated) === isFixable)
+  return [
+    ...SECTIONS.map(({ kind, title }) => ({ title, rows: ofKind(kind, true) })),
+    { title: NOTHING_TO_ALLOW, rows: SECTIONS.flatMap(({ kind }) => ofKind(kind, false)) },
+  ].filter(list => list.rows.length > 0)
 }
 
 /** A journal entry whose row offers Undo: a change still in place, or a removal not yet confirmed. */
@@ -144,10 +163,7 @@ export function buildPane(input: PaneInput): PaneModel {
     fault: input.fault,
     appliedOffset: Math.max(0, Math.min(input.appliedOffset, input.applied.length - 1)),
     empty: NO_BLOCKS[input.scope],
-    sections: SECTIONS.map(({ kind, title }) => ({
-      title,
-      rows: shown.filter(({ record }) => record.kind === kind).map(rated => recordRow(rated, context, now)),
-    })).filter(section => section.rows.length > 0),
+    sections: targetLists(shown).map(({ title, rows }) => ({ title, rows: rows.map(rated => recordRow(rated, context, now)) })),
     hidden: input.rated.filter(({ record }) => record.isHidden).map(({ record }) => ({ key: record.key, target: displayTarget(record, context.home) })),
     applied: [...input.applied].reverse().map(entry => {
       const file = fileInfo(entry.file, context.home)
@@ -263,11 +279,9 @@ export function reportText(rated: readonly Rated[], context: Context, isSandboxO
     settingsHeader(context.file),
     ...(isSandboxOn ? [] : [SANDBOX_OFF]),
   ]
-  for (const { kind, title } of SECTIONS) {
-    const rows = shown.filter(({ record }) => record.kind === kind).slice(0, ROW_LIMIT)
-    if (rows.length === 0) continue
+  for (const { title, rows } of targetLists(shown)) {
     lines.push('', title)
-    for (const { record, verdict } of rows) {
+    for (const { record, verdict } of rows.slice(0, ROW_LIMIT)) {
       lines.push(`- ${displayTarget(record, context.home)}: ${countsSummary(record, now)}`, ...displaySentences(record, verdict, context).map(sentence => `  ${sentence}`))
     }
   }
