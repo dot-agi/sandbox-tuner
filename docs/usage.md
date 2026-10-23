@@ -16,6 +16,22 @@ A sighting is one observation of one target in a Bash call or confirmed shell Mo
 | Listed | A host that Claude named in the `allowed_domains` of a command that ran. In auto mode, Claude is asked to name each host that your allowlist does not cover. Sandbox Tuner skips a wildcard entry, such as `*.example.org`. Outside auto mode the list opens nothing, but it still shows that the command needs the host. |
 | From error text | A permission error (`Operation not permitted`, `Read-only file system`) that names an absolute path or a simple relative path such as `.git/hooks/example`, in a sandboxed command that ran and whose sandbox report names no file. |
 
+### Confirmed and guessed blocks
+
+A Blocked sighting is a confirmed block: the sandbox reported it. A From error text sighting is a guessed block: Sandbox Tuner took the path from a permission error, and the sandbox did not confirm it.
+
+On macOS 27, Claude Code adds no `<sandbox_violations>` report for a blocked file write to the Bash result. Only the system log records it, as in `Sandbox: mkdir(37872) deny(1) file-write-create /path`, and Sandbox Tuner cannot read that log. So on macOS 27 every folder block is a guessed block, and a folder Allow rests on guessed blocks.
+
+A folder with guessed blocks gets Allow only within these limits, which make it safe enough:
+
+- Only the cache and temp folders that Sandbox Tuner names can get Allow. Every other folder rule still applies: protected places, credentials, system folders, folders that are too broad, wildcards, folders on `PATH`, and folders in the working directory get no Allow.
+- Guessed blocks count toward `minimumSightings` as confirmed blocks do, so the folder waits for the same number of sightings.
+- A label next to the Allow says `Guessed from error text: the sandbox did not confirm this block.`
+- Nothing changes until you press Allow. When you press an Allow that showed no label, and another session saved guessed blocks of the folder since, the press writes nothing and says so. The band and the pane then show the label: press Allow again.
+- At the press, Sandbox Tuner checks where the folder really lies, as for every folder Allow.
+
+The path in an error of `mkdir` names the folder that mkdir tried to create. So `mkdir -p ~/.cache/tool` gives the target `~/.cache/tool`. A guessed path directly in a cache root, such as `~/.cache/stamp`, is its own cache folder. So a guessed path inside a cache root never gives the whole cache root, such as `~/.cache`, as its target. A target with no guessed blocks follows the rules of Sandbox Tuner 1.1.7: a confirmed write directly in a cache root gives the cache root, which gets no Allow.
+
 A target is one of these:
 
 - A host, such as `registry.npmjs.org`.
@@ -66,7 +82,8 @@ On the terminal and in the desktop app, the band above the prompt explains the l
 1. What was blocked, for which command, and why. For example: `Sandbox blocked example.org:443 for "curl -sI https://example.org". The host is not on your sandbox allowlist, so Claude must list it on each command.`
 2. How often: `Seen 3 times in 2 sessions.`
 3. The verdict, and the exact change and effect of each fix that it offers.
-4. Its Buttons.
+4. When the Allow rests on guessed blocks, the label `Guessed from error text: the sandbox did not confirm this block.` (see [Confirmed and guessed blocks](#confirmed-and-guessed-blocks)).
+5. Its Buttons.
 
 | Button | Shown when | What it does |
 | --- | --- | --- |
@@ -92,7 +109,7 @@ Run `/sandbox-tuner`, or press **Open Sandbox Tuner** in the band. The pane show
 - The path of your user settings file.
 - A line when the sandbox is off in this session.
 - The last notice, and the last background problem when there is one.
-- **Hosts** and **Write folders**: the targets that have a fix, of the current session, or of every session with `scope: all`. Each target shows its counts, its verdict, and its Buttons. Targets with a fix ready come first, then targets that wait for more sightings.
+- **Hosts** and **Write folders**: the targets that have a fix, of the current session, or of every session with `scope: all`. Each target shows its counts, its verdict, and its Buttons. An Allow that rests on guessed blocks has the guessed-block label right above it. Targets with a fix ready come first, then targets that wait for more sightings.
 - **Nothing to allow here**: the targets that have no fix, hosts first, then write folders: first the targets with no settings fix, then the targets that your settings already allow. Each one keeps its counts, its explanation, and **Hide**. A target that your settings already allow has no **Hide**.
 - **Hidden**: the targets of the same scope that you hid, each with **Unhide**. Hide a target that you never want to open. A target that your settings already allow has no **Hide**.
 - **Applied**: the changes that Sandbox Tuner made in the current session, or in every session with `scope: all`, newest first, each with **Undo**. Sandbox Tuner keeps the 50 newest changes of every session, plus each change whose addition or removal is unconfirmed, and the list shows those of the scope.
@@ -100,7 +117,7 @@ Run `/sandbox-tuner`, or press **Open Sandbox Tuner** in the band. The pane show
 The counts of a target read like `5 confirmed blocks · 2 sessions · last 3 min ago · with curl · ports 443`:
 
 - `N confirmed blocks`: the Blocked sightings, from Claude Code's sandbox reports. For a host that you refused at the network prompt, `(you denied N)` follows.
-- `N guessed from error text`: for a write folder, the From error text sightings.
+- `N guessed from error text`: for a write folder, the guessed blocks, which are the From error text sightings.
 - `listed on N commands`: for a host, the Listed sightings.
 - Then the sessions that saw the target, the age of the last sighting, up to three program names, and the ports of a host.
 
@@ -114,7 +131,7 @@ Esc closes the pane. Tab moves between its Buttons, Enter presses one, and the a
 
 In an interactive session, `/sandbox-tuner` opens the pane and prints one line, such as `sandbox-tuner: 1 fix ready, 4 targets. The pane is open.` It runs at once, even while Claude works.
 
-In `claude -p "/sandbox-tuner"`, it prints a text report with the same lists, counts, and ranking: **Hosts**, **Write folders**, then **Nothing to allow here**. A `claude -p` run is a new session, so with `scope: session` the report says `Has not seen a sandbox block in this session yet.` Set `scope` to `all` for the report of every session. The report lists at most 25 targets in each section. When a surface cannot place the pane, the command prints the report and the reason. The command never writes settings.
+In `claude -p "/sandbox-tuner"`, it prints a text report with the same lists, counts, and ranking: **Hosts**, **Write folders**, then **Nothing to allow here**. The guessed-block label follows the Allow sentence of a target that rests on guessed blocks. A `claude -p` run is a new session, so with `scope: session` the report says `Has not seen a sandbox block in this session yet.` Set `scope` to `all` for the report of every session. The report lists at most 25 targets in each section. When a surface cannot place the pane, the command prints the report and the reason. The command never writes settings.
 
 ## Verdicts
 
@@ -127,7 +144,6 @@ In `claude -p "/sandbox-tuner"`, it prints a text report with the same lists, co
 
 Sandbox Tuner offers no **Allow** for:
 
-- Folders with any inferred sighting, including saved records mixed with explicit reports.
 - IP addresses and local host names.
 - A host that your settings already refuse.
 - Any host while your organization's managed settings lock the network allowlist (`allowManagedDomainsOnly`). **Deny** is not offered there either, because the sandbox refuses unlisted hosts anyway.
@@ -142,6 +158,8 @@ Sandbox Tuner offers no **Allow** for:
 - A folder in the working directory, where sandboxed commands can already write.
 - A path under one of your `denyWrite` entries, Read or Edit deny rules, or other read rules. Uncertain denial patterns also withhold Allow, as does the read block of `permissions.blockReadsOutsideWorkingDirectories`.
 - Any folder that is no cache or temp folder. Sandbox Tuner suggests `~/.cache/<tool>`, `~/Library/Caches/<app>`, the package caches of npm, Cargo, Gradle, Maven, and pnpm, the macOS per-user temp and cache folders, and the temp folders only. A temp folder is a folder strictly inside `/tmp` that holds the denied file. A temp folder in a system folder, in any letter case, gets no Allow. Sandbox Tuner compares the spelling, as it does for cache folders, so `/TMP/a`, `/tmp/a/../b`, `/var/tmp/a`, and `/private/tmp/a` name no temp folder. On macOS, `/tmp` is a link to `/private/tmp`, so a folder that a report names in `/private/tmp` gets no Allow as a temp folder. A cache folder there keeps the cache rule, such as `~/.cache/<tool>` when your home folder lies in `/private/tmp`. `/tmp` holds no temp folder when it holds your home folder, or your home folder holds it, in any letter case.
+
+These rules hold for confirmed and guessed blocks alike. A folder with guessed blocks that passes them gets **Allow** once it has `minimumSightings` sightings, with the guessed-block label next to the **Allow** (see [Confirmed and guessed blocks](#confirmed-and-guessed-blocks)).
 
 Sandbox Tuner reads the paths of sandbox entries, such as `sandbox.filesystem.allowWrite`, `denyWrite`, `denyRead`, and credentials files, the way the sandbox does: `~/` is your home folder, `/` and `//` start an absolute path, and any other entry is relative to the config folder (`~/.claude` by default) in user settings or to the project root in project and local settings. A relative sandbox entry in command-line or managed settings has no known anchor: Sandbox Tuner ignores it as a grant and treats it as a denial of every folder. It resolves `.` and `..` in each entry before it compares.
 
@@ -209,6 +227,7 @@ Each problem reads `sandbox-tuner: <event> (<detail>): <cause>`. Command results
 | `... is not valid JSON (...). Nothing was written. Fix the file, then press again.` | Fix the JSON syntax of your user settings file. The reason in parentheses shows `…` in place of the file text that the JSON parser quotes, so that no secret from `env` reaches the debug log. |
 | `... is a string, not an array of strings. Nothing was written.` | Make that key a list of strings. |
 | `... could not save a copy of ... Nothing was written.` | Make the `backups` folder of your config folder writable. |
+| `... another session saved blocks of this folder that Sandbox Tuner guessed from error text ... Nothing was written. Read the label, then press Allow again.` | The Allow that you pressed showed no guessed-block label, but the sightings that the press read again include guessed blocks (see [Confirmed and guessed blocks](#confirmed-and-guessed-blocks)). The band and the pane now show the label. Read it, then press Allow again. |
 | `... could not confirm that ... is unchanged since Sandbox Tuner read it ...` | Another session or program saved the settings file during the press, so Sandbox Tuner left it as it is. Press again. |
 | `... another Sandbox Tuner session holds the lock on ... and did not free it within 3 seconds ...` | A press in another session is writing the settings file. Press again. If it stays for 30 seconds, a press stopped while it held the lock, and the next press takes it over. |
 | `... another session or program changed ... after this press read it, and the press no longer fits the new text: ...` | The rest of the line says why, such as the verdict on the new text, or a file that is not valid JSON. Nothing was written. Read the file, then press again if you still want the change. |
@@ -250,7 +269,7 @@ Each problem reads `sandbox-tuner: <event> (<detail>): <cause>`. Command results
 - **A large guarded folder makes folder Allow refuse.** Sandbox Tuner walks the protected places and the credentials folders in two walks. Each walk reads at most 1,000 folders and 25,000 entries. A walk that needs to read more, or cannot read a folder, refuses the grant. A large `skills` folder, a credentials folder with many files, or very many installed plugins and VS Code extensions can cause `guarded directory traversal limit exceeded`. If you trust the folder, add it to `sandbox.filesystem.allowWrite` in your user settings file by hand.
 - **A temp folder Allow opens the folders inside it.** Each folder in `/tmp` is its own target, unless your home folder lies in `/tmp`, where the cache rule names the target. A blocked write that named a protected file or a key file keeps its own folder closed, but not a temp folder that holds that folder. For example, Allow for `/tmp/a` also opens `/tmp/a/b`, where an earlier blocked write named `/tmp/a/b/test.key`. Sandbox Tuner also does not look inside a temp folder for a `.git` or `.claude` folder that no blocked write named, such as a repository that you cloned into `/tmp`. Before you press Allow for a temp folder, check the rows of the folders inside it, and what the folder holds.
 - **Wildcard rules and rules with no known anchor make Sandbox Tuner cautious.** It counts an `Edit(<folder>/**)` allow rule as cover only when the folder has no wildcard. So it can offer Allow for a folder that a wildcard Edit rule already opens. A deny rule with a wildcard, in `permissions.deny` or in `sandbox.filesystem`, withholds Allow for every folder under the folder that holds its first wildcard. For example, `Read(~/**/*.key)` withholds Allow for every folder in your home folder. In command-line or managed settings, a rule path that starts with a single `/`, and a relative `sandbox.filesystem` entry, have no known anchor. Such an Edit allow rule or `allowWrite` entry counts as no cover. Such a deny rule or `denyWrite` or `denyRead` entry withholds Allow for every folder.
-- **Paths from error text can be wrong.** When no sandbox report names a file, Sandbox Tuner takes the path from a permission error such as `Operation not permitted`. Punctuation in the error can cut the path short. A relative path counts from the session working directory, which can differ from the folder where the command ran. The error can also come from a blocked read. So a folder with any such sighting never gets Allow, even when sandbox reports name it too. Its counts and explanation remain.
+- **Paths from error text can be wrong.** When no sandbox report names a file, Sandbox Tuner takes the path from a permission error such as `Operation not permitted`. Punctuation in the error can cut the path short. A relative path counts from the session working directory, which can differ from the folder where the command ran. The error can also come from a blocked read. So a guessed block can name the wrong folder. Sandbox Tuner offers Allow for it only within the limits in [Confirmed and guessed blocks](#confirmed-and-guessed-blocks), with a label next to the Allow. Read the path and the command before you press.
 - **A failed command can forge a sandbox report.** Claude Code adds the sandbox report of a failed command at the end of the command's output, and can add a proxy note after it. So Sandbox Tuner reads only the `<sandbox_violations>` block that ends that output, before any proxy note. It skips a block that other output follows, and writes a debug line. But a command that prints a block as its last output, for example from a file, and then fails, still forges a report: Sandbox Tuner counts that block as a block. Such a block counts only while the sandbox is on, and not when the command ran outside the sandbox at Claude's request. A Claude Code version that adds other text after its report makes Sandbox Tuner skip the real report too, with the same debug line. Before you press Allow, check that you expect the host or folder. Also check the command that the band names, or the programs that the pane lists.
 - **Read, Mach lookup, and socket blocks get no fix.** When a sandbox report names such an operation, the band explains it for the current session only. Sandbox Tuner saves no count for it and offers no Allow. For an operation that it does not know, the band says that it cannot classify it.
 - **Later background output goes unseen.** For a background Bash command or a shell Monitor launch, Sandbox Tuner counts the hosts that the launch declared, once, when it starts. It does not read the later output, so blocks there give no sighting.

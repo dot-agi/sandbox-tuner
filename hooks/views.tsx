@@ -6,14 +6,16 @@ import type { SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, Sandb
 import { cutText, plainText } from './names'
 import { isUndoUnresolved } from './records'
 import { fileInfo } from './settings-file'
+import { isGuessedAllow } from './verdicts'
 import type { Context, Rated, Verdict } from './verdicts'
 import {
-  APPLIED_NEXT, APPLIED_PREVIOUS, APPLY_HINT, BAND_KEY_HINT, NO_BLOCKS, SANDBOX_OFF, STILL_BLOCKED, appliedLine, countsSentence, countsSummary, displayTarget, explanation, lastProblem, moreRows,
+  APPLIED_NEXT, APPLIED_PREVIOUS, APPLY_HINT, BAND_KEY_HINT, GUESSED_ALLOW, NO_BLOCKS, SANDBOX_OFF, STILL_BLOCKED, appliedLine, countsSentence, countsSummary, displayTarget, explanation, lastProblem, moreRows,
   openedLine, reformatSentence, reportHeadline, settingsHeader, undoSentence, verdictSentences,
 } from './words'
 
 type Kit = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextProps>; Button: ElementConstructor<ButtonProps> }
-type BandModel = { explanation: string; counts: string; sentences: string[]; error: string | null; canAllow: boolean; canDeny: boolean }
+// `guessed`: the label of an Allow whose target has blocks guessed from error text (guessedLabel), else null.
+type BandModel = { explanation: string; counts: string; sentences: string[]; guessed: string | null; error: string | null; canAllow: boolean; canDeny: boolean }
 type BandActions = { allow: () => void; deny: () => void; open: () => void; dismiss: () => void }
 
 // Sandbox Tuner's own cap on one problem text, so that a long cause leaves the pane lists their room in TEXT_BUDGET.
@@ -32,18 +34,24 @@ function displaySentences(record: SandboxTunerRecord, verdict: Verdict, context:
   return [...verdictSentences(record, verdict, context), ...(verdict.status === 'covered' ? [STILL_BLOCKED] : [])]
 }
 
+/** The label of an Allow whose target has blocks guessed from error text, or null: it goes next to the Allow. */
+function guessedLabel(record: SandboxTunerRecord, verdict: Verdict): string | null {
+  return isGuessedAllow(record, verdict) ? GUESSED_ALLOW : null
+}
+
 export function buildBand(latest: SandboxTunerLatest, record: SandboxTunerRecord, verdict: Verdict, context: Context, notice: SandboxTunerNotice | null): BandModel {
   return {
     ...buildObservation(latest, notice),
     counts: countsSentence(record),
     sentences: displaySentences(record, verdict, context),
+    guessed: guessedLabel(record, verdict),
     ...fixActions(verdict),
   }
 }
 
 export function buildObservation(latest: SandboxTunerLatest, notice: SandboxTunerNotice | null): BandModel {
   return {
-    explanation: explanation(latest), counts: '', sentences: [], canAllow: false, canDeny: false,
+    explanation: explanation(latest), counts: '', sentences: [], guessed: null, canAllow: false, canDeny: false,
     error: notice !== null && notice.isError && notice.at >= latest.at ? notice.text : null,
   }
 }
@@ -81,6 +89,7 @@ export function bandTree(kit: Kit, model: BandModel, actions: BandActions, benea
             {drawable(model.error)}
           </Text>
         )}
+        {model.guessed === null ? null : <Text color="yellow" wrap="wrap">{model.guessed}</Text>}
         <Box gap={ROW_GAP}>
           {model.canAllow ? <Button key="band-allow" label={BAND_LABELS.allow} variant="primary" onPress={actions.allow} /> : null}
           {model.canDeny ? <Button key="band-deny" label={BAND_LABELS.deny} onPress={actions.deny} /> : null}
@@ -106,7 +115,7 @@ const SECTIONS = [
 // The heading of the targets that have no fix: no settings fix, or a target that the settings already allow.
 const NOTHING_TO_ALLOW = 'Nothing to allow here'
 
-type RecordRow = { key: string; target: string; summary: string; sentences: string[]; canAllow: boolean; canDeny: boolean; canHide: boolean }
+type RecordRow = { key: string; target: string; summary: string; sentences: string[]; guessed: string | null; canAllow: boolean; canDeny: boolean; canHide: boolean }
 type PaneSection = { title: string; rows: RecordRow[] }
 type AppliedRow = { id: string; line: string; undo: string | null; retry: boolean }
 
@@ -114,7 +123,8 @@ type AppliedRow = { id: string; line: string; undo: string | null; retry: boolea
 // `scope`: the scope option, which names what an empty pane has not seen.
 type PaneInput = { rated: readonly Rated[]; applied: readonly SandboxTunerApplied[]; reformatted: readonly string[]; appliedOffset: number; notice: SandboxTunerNotice | null; fault: string | null; isSandboxOn: boolean; context: Context; now: number; scope: SandboxTunerScope }
 type PaneModel = { header: string; isSandboxOn: boolean; notice: SandboxTunerNotice | null; fault: string | null; sections: PaneSection[]; hidden: { key: string; target: string }[]; applied: AppliedRow[]; appliedOffset: number; empty: string }
-type PaneActions = { allow: (key: string) => void; deny: (key: string) => void; hide: (key: string) => void; unhide: (key: string) => void; undo: (id: string) => void; moveApplied: (delta: number) => void }
+// `isLabeled`: whether the drawing of the Allow showed the guessed-block label.
+type PaneActions = { allow: (key: string, isLabeled: boolean) => void; deny: (key: string) => void; hide: (key: string) => void; unhide: (key: string) => void; undo: (id: string) => void; moveApplied: (delta: number) => void }
 
 function visible(rated: readonly Rated[]): Rated[] {
   return rated.filter(({ record }) => !record.isHidden)
@@ -148,6 +158,7 @@ function recordRow({ record, verdict }: Rated, context: Context, now: number): R
     target: displayTarget(record, context.home),
     summary: countsSummary(record, now),
     sentences: displaySentences(record, verdict, context),
+    guessed: guessedLabel(record, verdict),
     ...fixActions(verdict),
     canHide: verdict.status !== 'covered',
   }
@@ -242,8 +253,9 @@ export function paneTree(kit: Kit, model: PaneModel, actions: PaneActions): Rend
       {row.sentences.map(sentence => (
         <Text wrap="wrap">{sentence}</Text>
       ))}
+      {row.guessed === null ? null : <Text color="yellow" wrap="wrap">{row.guessed}</Text>}
       <Box gap={2}>
-        {row.canAllow ? <Button key={`allow:${row.key}`} label="Allow" variant="primary" onPress={() => actions.allow(row.key)} /> : null}
+        {row.canAllow ? <Button key={`allow:${row.key}`} label="Allow" variant="primary" onPress={() => actions.allow(row.key, row.guessed !== null)} /> : null}
         {row.canDeny ? <Button key={`deny:${row.key}`} label="Deny" onPress={() => actions.deny(row.key)} /> : null}
         {row.canHide ? <Button key={`hide:${row.key}`} label="Hide" onPress={() => actions.hide(row.key)} /> : null}
       </Box>
@@ -282,7 +294,8 @@ export function reportText(rated: readonly Rated[], context: Context, isSandboxO
   for (const { title, rows } of targetLists(shown)) {
     lines.push('', title)
     for (const { record, verdict } of rows.slice(0, ROW_LIMIT)) {
-      lines.push(`- ${displayTarget(record, context.home)}: ${countsSummary(record, now)}`, ...displaySentences(record, verdict, context).map(sentence => `  ${sentence}`))
+      const guessed = guessedLabel(record, verdict)
+      lines.push(`- ${displayTarget(record, context.home)}: ${countsSummary(record, now)}`, ...[...displaySentences(record, verdict, context), ...(guessed === null ? [] : [guessed])].map(sentence => `  ${sentence}`))
     }
   }
   return [...lines, '', APPLY_HINT].join('\n')
