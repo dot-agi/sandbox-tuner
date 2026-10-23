@@ -92,9 +92,19 @@ Run `/sandbox-tuner`, or press **Open Sandbox Tuner** in the band. The pane show
 - The path of your user settings file.
 - A line when the sandbox is off in this session.
 - The last notice, and the last background problem when there is one.
-- **Hosts** and **Write folders**: the targets that the current session saw, or the targets of every session with `scope: all`. Each target shows its counts, its verdict, and its Buttons. Targets with a fix ready come first, then targets that wait for more sightings, then targets with no settings fix, then targets that your settings already allow.
+- **Hosts** and **Write folders**: the targets that have a fix, of the current session, or of every session with `scope: all`. Each target shows its counts, its verdict, and its Buttons. Targets with a fix ready come first, then targets that wait for more sightings.
+- **Nothing to allow here**: the targets that have no fix, hosts first, then write folders: first the targets with no settings fix, then the targets that your settings already allow. Each one keeps its counts, its explanation, and **Hide**. A target that your settings already allow has no **Hide**.
 - **Hidden**: the targets of the same scope that you hid, each with **Unhide**. Hide a target that you never want to open. A target that your settings already allow has no **Hide**.
 - **Applied**: the changes that Sandbox Tuner made in the current session, or in every session with `scope: all`, newest first, each with **Undo**. Sandbox Tuner keeps the 50 newest changes of every session, plus each change whose addition or removal is unconfirmed, and the list shows those of the scope.
+
+The counts of a target read like `5 confirmed blocks · 2 sessions · last 3 min ago · with curl · ports 443`:
+
+- `N confirmed blocks`: the Blocked sightings, from Claude Code's sandbox reports. For a host that you refused at the network prompt, `(you denied N)` follows.
+- `N guessed from error text`: for a write folder, the From error text sightings.
+- `listed on N commands`: for a host, the Listed sightings.
+- Then the sessions that saw the target, the age of the last sighting, up to three program names, and the ports of a host.
+
+A part that is 0 is left out, such as `27 guessed from error text · 1 session · last just now`. When every part is 0, a write folder shows `0 confirmed blocks · 0 guessed from error text`, and a host shows `0 confirmed blocks`.
 
 Each list shows at most 25 rows, then `+<n> more`. A list also ends early when its next row would pass Sandbox Tuner's own text budget of 90,000 characters for the pane. That budget leaves room under the 100,000 characters that Claude Code draws in one drawing. The Applied list gets its room first. Use **Older changes** and **Newer changes** to reach every retained change, including changes beyond the row or text limit.
 
@@ -104,7 +114,7 @@ Esc closes the pane. Tab moves between its Buttons, Enter presses one, and the a
 
 In an interactive session, `/sandbox-tuner` opens the pane and prints one line, such as `sandbox-tuner: 1 fix ready, 4 targets. The pane is open.` It runs at once, even while Claude works.
 
-In `claude -p "/sandbox-tuner"`, it prints a text report with the same ranking. A `claude -p` run is a new session, so with `scope: session` the report says `Has not seen a sandbox block in this session yet.` Set `scope` to `all` for the report of every session. The report lists at most 25 targets in each section. When a surface cannot place the pane, the command prints the report and the reason. The command never writes settings.
+In `claude -p "/sandbox-tuner"`, it prints a text report with the same lists, counts, and ranking: **Hosts**, **Write folders**, then **Nothing to allow here**. A `claude -p` run is a new session, so with `scope: session` the report says `Has not seen a sandbox block in this session yet.` Set `scope` to `all` for the report of every session. The report lists at most 25 targets in each section. When a surface cannot place the pane, the command prints the report and the reason. The command never writes settings.
 
 ## Verdicts
 
@@ -252,7 +262,7 @@ Each problem reads `sandbox-tuner: <event> (<detail>): <cause>`. Command results
 - **A relative `CLAUDE_CONFIG_DIR` moves with the session.** Sandbox Tuner takes it from the session's project root: the folder where the session started, or where `/cd` or a worktree move took it. After such a move, Allow and Deny edit a different `settings.json`. The pane names the file after "Settings file:". Set `CLAUDE_CONFIG_DIR` to an absolute path.
 - **Undo reaches only the 50 newest changes.** The Applied list keeps the 50 newest changes of every session, plus each change whose addition or removal is unconfirmed. With `scope: session`, it shows those of the current session. An older change has no Undo. To take it back, remove its entry from your user settings file by hand.
 - **The saved data only grows.** Each session saves its own sightings, and Sandbox Tuner deletes no saved sighting and no Undo record of a written change. Near Claude Code's 4 MiB store limit, saves fail with a `sandbox-tuner:` problem, and Allow, Deny, and Undo can refuse to write. After a failed sighting save, Allow and Deny refuse for the rest of that session. To start over, quit Claude Code and delete Sandbox Tuner's file in `$CLAUDE_CONFIG_DIR/plugins/store/`, or in `~/.claude/plugins/store/` when `CLAUDE_CONFIG_DIR` is unset. The file name starts with `sandbox-tuner`. This also deletes its Undo records.
-- **Counts are a guide, and some counts and lists are capped.** Claude Code does not document whether saves from two sessions at the same moment both last, so a count can fall short. The pane and the report show only the newest 300 targets seen within 30 days. The Hosts, Write folders, and Hidden lists of the pane, and each section of the report, show at most 25 targets. One call counts at most three write folders, and a further write folder in that call gets no count and no explanation. Sandbox Tuner reads only the last 200,000 characters of the output and of the error output of a call. A target keeps at most five ports, and checks against port-specific settings entries use only those ports. A target keeps at most 20 session ids and three program names. So the band, the pane, and the report count at most 20 sessions, and the pane and the report name at most three programs. Each Claude Code process keeps its own record of a target, with the 20 newest of its sessions. With `scope: session`, a resumed session shows the target only while one such record still names it.
+- **Counts are a guide, and some counts and lists are capped.** Claude Code does not document whether saves from two sessions at the same moment both last, so a count can fall short. The pane and the report show only the newest 300 targets seen within 30 days. The Hosts, Write folders, Nothing to allow here, and Hidden lists of the pane, and each section of the report, show at most 25 targets. One call counts at most three write folders, and a further write folder in that call gets no count and no explanation. Sandbox Tuner reads only the last 200,000 characters of the output and of the error output of a call. A target keeps at most five ports, and checks against port-specific settings entries use only those ports. A target keeps at most 20 session ids and three program names. So the band, the pane, and the report count at most 20 sessions, and the pane and the report name at most three programs. Each Claude Code process keeps its own record of a target, with the 20 newest of its sessions. With `scope: session`, a resumed session shows the target only while one such record still names it.
 
 ## Troubleshooting
 

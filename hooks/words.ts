@@ -97,12 +97,24 @@ export function countsSentence(record: SandboxTunerRecord): string {
   return `Seen ${plural(sightingTotal(record.counts), 'time')} in ${plural(record.sessions.length, 'session')}.`
 }
 
-export function countsSummary(record: SandboxTunerRecord, now: number): string {
+/**
+ * The counts of a target in words: its confirmed blocks (sandbox reports), and for a folder the blocks guessed from
+ * error text, or for a host the commands that listed it. A part that is 0 is left out, unless every part is 0.
+ */
+function countWords(record: SandboxTunerRecord): string {
   const { blocked, refused, listed, inferred } = record.counts
-  const head =
+  const confirmed = `${plural(blocked, 'confirmed block')}${refused > 0 ? ` (you denied ${refused})` : ''}`
+  const parts: [number, string][] =
     record.kind === 'path'
-      ? `blocked ${blocked}${inferred > 0 ? ` · from error text ${inferred}` : ''}`
-      : `blocked ${blocked}${refused > 0 ? ` (you denied ${refused})` : ''}${listed > 0 ? ` · listed on ${plural(listed, 'command')}` : ''}`
+      ? [[blocked, confirmed], [inferred, `${inferred} guessed from error text`]]
+      : [[blocked, confirmed], [listed, `listed on ${plural(listed, 'command')}`]]
+  const counted = parts.filter(([count]) => count > 0).map(([, words]) => words)
+  // A host is never guessed from error text: with nothing counted, its line still says how many blocks were confirmed.
+  return counted.length > 0 ? counted.join(' · ') : record.kind === 'path' ? parts.map(([, words]) => words).join(' · ') : confirmed
+}
+
+export function countsSummary(record: SandboxTunerRecord, now: number): string {
+  const head = countWords(record)
   const programs = record.seenWith.length > 0 ? ` · with ${record.seenWith.join(', ')}` : ''
   const ports = record.ports.length > 0 ? ` · ports ${record.ports.join(', ')}` : ''
   return `${head} · ${plural(record.sessions.length, 'session')} · last ${age(now - record.lastSeen)}${programs}${ports}`

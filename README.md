@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/Claude_Code-mod-555555" alt="Claude Code mod">
   <img src="https://img.shields.io/badge/license-MIT-78997A" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.1.6-555555" alt="Version: 1.1.6">
+  <img src="https://img.shields.io/badge/version-1.1.7-555555" alt="Version: 1.1.7">
 </p>
 
 <p align="center"><strong>Sandbox Tuner turns the recurring sandbox blocks of your current Claude Code session into reviewed, undoable settings edits.</strong></p>
@@ -24,7 +24,7 @@ So Sandbox Tuner reads Bash results, and the hosts that background Bash commands
 ## Features
 
 - **An explanation above the prompt.** The band names the blocked target, the command, and the reason, in the terminal and the desktop app.
-- **A ranking for the current session.** `/sandbox-tuner` lists the hosts and write folders that the current session saw, with ready fixes first. Each count also includes the sightings of earlier sessions. Hide the targets that you do not want to see, except a target that your settings already allow.
+- **A ranking for the current session.** `/sandbox-tuner` lists the hosts and write folders that the current session saw, with ready fixes first. The targets that have no fix come last, under **Nothing to allow here**. Each count, such as `5 confirmed blocks` or `27 guessed from error text`, also includes the sightings of earlier sessions. Hide the targets that you do not want to see, except a target that your settings already allow.
 - **A change you review.** Allow shows the exact entry and its effect before you press it. Deny appears for a host that you refused at the network prompt, unless an allowlist lock applies.
 - **Undo and a backup.** Each settings edit gets an Undo record. The pane lists the edits of the current session. A backup keeps the settings file as it was before the latest write.
 - **Every session on request.** Set the `scope` option to `all` to show the targets and the edits of every session, as Sandbox Tuner 1.1.3 does.
@@ -32,7 +32,7 @@ So Sandbox Tuner reads Bash results, and the hosts that background Bash commands
 
 ![The Sandbox Tuner pane beside the transcript: example.org is ready with Allow and Hide, example.net waits at 1 of 3 sightings.](docs/images/pane.svg)
 
-`/sandbox-tuner` ranks blocked hosts: a ready fix first, then waiting ones.
+`/sandbox-tuner` ranks blocked hosts: a ready fix first, then waiting ones. Targets that have no fix come last, under **Nothing to allow here**.
 
 ![Terminal: a write to .git/hooks fails in the sandbox, and the band explains that no setting opens such a path.](docs/images/nofix.svg)
 
