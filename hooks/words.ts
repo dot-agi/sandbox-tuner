@@ -24,6 +24,8 @@ export const APPLY_HINT = 'To apply a fix, run /sandbox-tuner in an interactive 
 export const COMMAND_DESCRIPTION = 'Review the hosts and write folders the sandbox keeps blocking.'
 // The keyboard path to the band Buttons, drawn dim after them: Claude Code's focus chord, then Tab, Enter, or Esc.
 export const BAND_KEY_HINT = 'ctrl+x tab to choose'
+// The label next to an Allow whose target has blocks that Sandbox Tuner guessed from error text.
+export const GUESSED_ALLOW = 'Guessed from error text: the sandbox did not confirm this block.'
 export const STILL_BLOCKED = 'If the sandbox still blocks it, the cause is elsewhere, such as a tool that ignores the sandbox proxy, a read block, or file permissions. Check the client’s proxy settings and supported protocols. Run /status or /doctor for managed-settings warnings.'
 
 const SHARED_FOLDER = 'Every app you run keeps files in this folder, so sandboxed commands could change files that other apps read.'
@@ -34,7 +36,6 @@ const CHANGE_EFFECTS: Readonly<Record<SandboxTunerSettingsKey, string>> = {
   'sandbox.filesystem.allowWrite': 'Sandboxed commands can then write anywhere under it, and programs that run outside the sandbox may later load what they wrote.',
 }
 const NO_FIX: Readonly<Record<NoFixReason, (detail: string, target: string) => string>> = {
-  'unverified-path': () => 'This folder includes an unverified path inferred from error text. Punctuation can hide protected filenames. Sandbox Tuner cannot offer Allow.',
   'not-dns': () => 'Sandbox Tuner does not suggest IP addresses or local host names.',
   'denied-by-settings': detail => `Your setting "${detail}" already refuses this host.`,
   'managed-lock': (_, target) => `Your organization's managed settings lock the network allowlist. Ask your administrator to allow ${target}.`,

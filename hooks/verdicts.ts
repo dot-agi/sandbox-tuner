@@ -30,7 +30,7 @@ export type Context = {
 }
 export type Change = { action: SandboxTunerAction; settingsKey: SandboxTunerSettingsKey; entry: string; file: FileInfo }
 export type NoFixReason =
-  | 'unverified-path' | 'not-dns' | 'denied-by-settings' | 'managed-lock' | 'protected' | 'credentials' | 'system' | 'too-broad'
+  | 'not-dns' | 'denied-by-settings' | 'managed-lock' | 'protected' | 'credentials' | 'system' | 'too-broad'
   | 'glob' | 'on-path' | 'inside-workspace' | 'deny-rule' | 'write-pattern' | 'read-rule' | 'read-pattern' | 'not-a-cache' | 'no-settings-file'
 export type Verdict =
   | { status: 'ready'; allow: Change; deny: Change | null }
@@ -363,7 +363,17 @@ function hostVerdict(record: SandboxTunerRecord, context: Context): Verdict {
   })
 }
 
-function pathVerdict(record: SandboxTunerRecord, context: Context): Verdict {
+/**
+ * Whether the saved sample of a folder target names the folder itself: a folder that a command tried to create, guessed
+ * from error text (sightings.ts). Only a target with guessed sightings can have one. The target of a file is always a
+ * folder that holds it. Compare the saved paths, as written, before any link is resolved.
+ */
+export function isGuessedFolder(record: SandboxTunerRecord): boolean {
+  return record.kind === 'path' && record.counts.inferred > 0 && record.sample === record.target
+}
+
+/** `isFolder`: whether the sample names the folder itself (isGuessedFolder), from the saved record. */
+function pathVerdict(record: SandboxTunerRecord, context: Context, isFolder: boolean): Verdict {
   const { target, sample } = record
   if (isProtected(target, context) || isProtected(sample, context)) return noFix('protected', '')
   if (isCredential(record, context)) return noFix('credentials', '')
@@ -386,23 +396,31 @@ function pathVerdict(record: SandboxTunerRecord, context: Context): Verdict {
   )
   if (coveredBy !== undefined) return { status: 'covered', source: coveredBy }
   // A folder strictly inside /tmp that holds the denied file is a temp folder: the target that Sandbox Tuner 1.1.1 names.
-  const isTemp = context.tmp !== null && isTempFolder(target, context.home, context.tmp) && folderTarget(sample, context.home) === target
-  if (cacheFolder(sample, context.home) !== target && !isTemp) return noFix('not-a-cache', '')
+  const isTemp = context.tmp !== null && isTempFolder(target, context.home, context.tmp) && folderTarget(sample, context.home, isFolder) === target
+  if (cacheFolder(sample, context.home, isFolder) !== target && !isTemp) return noFix('not-a-cache', '')
   // A temp folder in a system folder in another letter case, which a file system that ignores case treats as the same.
   if (isTemp && SYSTEM_FOLDERS.some(folder => isUnder(target.toLowerCase(), folder.toLowerCase()))) return noFix('system', '')
   // Guard the entire folder, including credentials elsewhere inside it.
   if (context.protectedDirs.some(dir => isUnder(dir, target))) return noFix('protected', '')
   if ([...context.credentialDirs, ...credentials.map(entry => entry.path)].some(path => isUnder(path, target))) return noFix('credentials', '')
-  if (record.counts.inferred > 0) return noFix('unverified-path', '')
   return withFile(context, file => byCount(record, context, { action: 'allow', settingsKey: 'sandbox.filesystem.allowWrite', entry: displayPath(target, context.home), file }, null))
 }
 
-export function verdictOf(record: SandboxTunerRecord, context: Context): Verdict {
+/** Whether the Allow of a record rests on blocks guessed from error text: then it carries the guessed-block label. */
+export function isGuessedAllow(record: SandboxTunerRecord, verdict: Verdict): boolean {
+  return verdict.status === 'ready' && record.counts.inferred > 0
+}
+
+/**
+ * The verdict of a record. A check of where a folder really lies passes the record with resolved paths, and
+ * `isFolder` of the saved record: a link can make a resolved sample equal its target.
+ */
+export function verdictOf(record: SandboxTunerRecord, context: Context, isFolder = isGuessedFolder(record)): Verdict {
   switch (record.kind) {
     case 'host':
       return hostVerdict(record, context)
     case 'path':
-      return pathVerdict(record, context)
+      return pathVerdict(record, context, isFolder)
   }
 }
 

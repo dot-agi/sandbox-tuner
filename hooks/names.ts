@@ -147,32 +147,43 @@ function sharedFolderLength(parts: readonly string[]): number | null {
   return root === undefined ? null : root.length + 3
 }
 
-/** How many leading parts name the cache or temp folder that holds the path, or null. */
-function cacheLength(parts: readonly string[], home: string | undefined): number | null {
+/**
+ * How many leading parts name the cache or temp folder that holds the path, or null. A folder (`isFolder`) can be that
+ * cache or temp folder itself.
+ */
+function cacheLength(parts: readonly string[], home: string | undefined, isFolder: boolean): number | null {
   // An empty, `.`, or `..` segment makes the text name another folder (`~/.cache/..` is HOME), so no cache holds it.
   if (parts.slice(1).some(part => part === '' || part === '.' || part === '..')) return null
+  // The parts that a path must have past the cache folder: a file lies in it, a folder can be it.
+  const past = isFolder ? 0 : 1
   const shared = sharedFolderLength(parts)
-  if (shared !== null) return parts.length > shared ? shared : null
+  if (shared !== null) return parts.length >= shared + past ? shared : null
   const homeParts = home?.split('/')
   if (homeParts === undefined || !startsWithParts(parts, homeParts)) return null
   const rest = parts.slice(homeParts.length)
-  // `<root>/<name>/...`: at least one segment after <name>, so a file directly in a root names no cache.
-  const named = NAMED_CACHE_ROOTS.find(root => startsWithParts(rest, root) && rest.length > root.length + 1)
+  // `<root>/<name>/...`: a file directly in a root names no cache.
+  const named = NAMED_CACHE_ROOTS.find(root => startsWithParts(rest, root) && rest.length >= root.length + 1 + past)
   if (named !== undefined) return homeParts.length + named.length + 1
-  const store = PACKAGE_CACHES.find(cache => startsWithParts(rest, cache) && rest.length > cache.length)
+  const store = PACKAGE_CACHES.find(cache => startsWithParts(rest, cache) && rest.length >= cache.length + past)
   return store === undefined ? null : homeParts.length + store.length
 }
 
-/** The cache or temp folder that holds a denied path, or null when none does. */
-export function cacheFolder(path: string, home: string | undefined): string | null {
+/**
+ * The cache or temp folder that holds a denied path, or null when none does. A folder that a command tried to create
+ * (`isFolder`) can be its own cache folder, such as `~/.cache/tool` from `mkdir ~/.cache/tool`.
+ */
+export function cacheFolder(path: string, home: string | undefined, isFolder = false): string | null {
   const parts = path.split('/')
-  const length = cacheLength(parts, home)
+  const length = cacheLength(parts, home, isFolder)
   return length === null ? null : parts.slice(0, length).join('/')
 }
 
-/** The folder target of a denied path: its cache or temp folder, else the folder that holds it. */
-export function folderTarget(path: string, home: string | undefined): string {
-  return cacheFolder(path, home) ?? (path.slice(0, path.lastIndexOf('/')) || '/')
+/**
+ * The folder target of a denied path: its cache or temp folder, else the folder that holds it. A folder that a command
+ * tried to create (`isFolder`) is its own target when no cache folder holds it.
+ */
+export function folderTarget(path: string, home: string | undefined, isFolder = false): string {
+  return cacheFolder(path, home, isFolder) ?? (isFolder ? path : path.slice(0, path.lastIndexOf('/')) || '/')
 }
 
 /**

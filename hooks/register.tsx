@@ -11,7 +11,7 @@ import { addEntry, fileInfo, isApplied, lockText, parseSettings, readLock, remov
 import type { FileInfo, ParsedSettings } from './settings-file'
 import { keepGated, latestOf, readCall, reportQuote } from './sightings'
 import type { BashCall, BashOutcome, GatedSighting, Sighting } from './sightings'
-import { anchorEntry, credentialEntries, denialEntries, denialVerdict, grantsMet, guardedPlaces, guardedWalks, isSkipped, rateRecords, sandboxFacts, verdictOf } from './verdicts'
+import { anchorEntry, credentialEntries, denialEntries, denialVerdict, grantsMet, guardedPlaces, guardedWalks, isGuessedAllow, isGuessedFolder, isSkipped, rateRecords, sandboxFacts, verdictOf } from './verdicts'
 import type { Change, Context, Sources, Verdict, Walk } from './verdicts'
 import { bandTree, buildBand, buildObservation, buildPane, canUndo, drawable, paneTree, reportText, summaryLine } from './views'
 import {
@@ -652,7 +652,7 @@ async function checkRealFolder($: EngineInterface, record: SandboxTunerRecord, c
     }
     // The denied file is rated where the write really lands: it can be a link too.
     const located = { ...record, target, sample: await realLocation($, record.sample, known) }
-    const verdict = denialVerdict([record.sample, located.sample], denials) ?? verdictOf(located, real)
+    const verdict = denialVerdict([record.sample, located.sample], denials) ?? verdictOf(located, real, isGuessedFolder(record))
     const place = displayPath(target, real.home)
     const leads = place === shown ? '' : `${shown} leads to ${place}. `
     if (verdict.status === 'ready') {
@@ -866,7 +866,8 @@ function changeFor(verdict: Verdict, action: SandboxTunerAction): Change | null 
 }
 
 // `session`: the session id that the journal entry keeps, undefined when the press could not read it (pressSession).
-type AddEdit = { kind: 'add'; record: SandboxTunerRecord; action: SandboxTunerAction; context: Context; session: string | undefined }
+// `isLabeled`: whether the drawing of the pressed Allow showed the guessed-block label (unlabeledGuess).
+type AddEdit = { kind: 'add'; record: SandboxTunerRecord; action: SandboxTunerAction; context: Context; session: string | undefined; isLabeled: boolean }
 type RemoveEdit = { kind: 'remove'; entry: SandboxTunerApplied }
 type SettingsEdit = AddEdit | RemoveEdit
 
@@ -955,6 +956,8 @@ async function recheckPlan($: EngineInterface, buttonKey: string, first: Planned
   if (JSON.stringify(record) === JSON.stringify(edit.record)) return first
   const verdict = verdictOf(record, edit.context)
   if (changeFor(verdict, edit.action) === null) return info(nothingApplied(verdictSentences(record, verdict, edit.context)))
+  const unlabeled = await unlabeledGuess($, buttonKey, edit, record, verdict)
+  if (unlabeled !== null) return unlabeled
   if (record.kind === 'path') {
     const problem = await checkRealFolder($, record, edit.context)
     if (problem !== null) return failure(buttonKey, problem)
@@ -1058,7 +1061,18 @@ function pressSession(scope: SandboxTunerScope, buttonKey: string, origin: Origi
   return scope === 'all' ? { session: undefined } : failure(buttonKey, `could not read the session id: ${origin.cause}. Nothing was written.`)
 }
 
-async function applyFix($: EngineInterface, threshold: number, scope: SandboxTunerScope, key: string, action: SandboxTunerAction, buttonKey: string, origin: Origin): Promise<PressResult> {
+/**
+ * Stops an Allow whose drawing did not show the guessed-block label when the evidence that the press read again needs
+ * it: another session saved a guessed sighting of the target since the drawing. It shows the fresh record, so that the
+ * next drawing shows the label, and the next press of that Allow can write. Null when the press goes on.
+ */
+async function unlabeledGuess($: EngineInterface, buttonKey: string, edit: Pick<AddEdit, 'action' | 'isLabeled'>, record: SandboxTunerRecord, verdict: Verdict): Promise<PressResult | null> {
+  if (edit.action !== 'allow' || edit.isLabeled || !isGuessedAllow(record, verdict)) return null
+  await update($, records, list => list.map(item => (item.key === record.key ? record : item)))
+  return failure(buttonKey, 'another session saved blocks of this folder that Sandbox Tuner guessed from error text, so its Allow now rests on guessed blocks and carries the guessed-block label. Nothing was written. Read the label, then press Allow again.')
+}
+
+async function applyFix($: EngineInterface, threshold: number, scope: SandboxTunerScope, key: string, action: SandboxTunerAction, buttonKey: string, origin: Origin, isLabeled = false): Promise<PressResult> {
   let context: Context
   try {
     context = await loadContext($, threshold, `ui.press (${buttonKey})`)
@@ -1068,9 +1082,11 @@ async function applyFix($: EngineInterface, threshold: number, scope: SandboxTun
   const record = await targetRecord($, key, buttonKey)
   if (!('key' in record)) return record
   if (context.file === undefined) return info(nothingApplied(verdictSentences(record, verdictOf(record, context), context)))
+  const unlabeled = await unlabeledGuess($, buttonKey, { action, isLabeled }, record, verdictOf(record, context))
+  if (unlabeled !== null) return unlabeled
   const pressed = pressSession(scope, buttonKey, origin)
   if (!('session' in pressed)) return pressed
-  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context, session: pressed.session }, () => pressStop($, scope, origin))
+  return editSettings($, buttonKey, context.file, { kind: 'add', record, action, context, session: pressed.session, isLabeled }, () => pressStop($, scope, origin))
 }
 
 async function openPress($: EngineInterface, scope: SandboxTunerScope): Promise<PressResult | null> {
@@ -1385,7 +1401,7 @@ export const register: Register = (on, options) => {
     const model = buildBand(last, record, verdictOf(record, context), context, await noticeNow($, scope))
     const beneath: RenderElement = await next(e)
     return bandTree($.ui.resolve(e), model, {
-      allow: () => void runPress($, scope, 'band-allow', origin => applyFix($, threshold, scope, record.key, 'allow', 'band-allow', origin)),
+      allow: () => void runPress($, scope, 'band-allow', origin => applyFix($, threshold, scope, record.key, 'allow', 'band-allow', origin, model.guessed !== null)),
       deny: () => void runPress($, scope, 'band-deny', origin => applyFix($, threshold, scope, record.key, 'deny', 'band-deny', origin)),
       open: () => void runPress($, scope, 'band-open', () => openPress($, scope)),
       dismiss: () => void runPress($, scope, 'band-dismiss', () => dismissPress($, record.key)),
@@ -1413,7 +1429,7 @@ export const register: Register = (on, options) => {
       scope,
     })
     return paneTree($.ui.resolve(e), model, {
-      allow: key => void runPress($, scope, `allow:${key}`, origin => applyFix($, threshold, scope, key, 'allow', `allow:${key}`, origin)),
+      allow: (key, isLabeled) => void runPress($, scope, `allow:${key}`, origin => applyFix($, threshold, scope, key, 'allow', `allow:${key}`, origin, isLabeled)),
       deny: key => void runPress($, scope, `deny:${key}`, origin => applyFix($, threshold, scope, key, 'deny', `deny:${key}`, origin)),
       hide: key => void runPress($, scope, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
       unhide: key => void runPress($, scope, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),

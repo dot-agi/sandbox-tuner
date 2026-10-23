@@ -1,7 +1,7 @@
 // Reads one Bash call into sightings.
 
 import type { SandboxTunerKind, SandboxTunerLatest } from '../types'
-import { absolutePath, folderTarget, isGuardedPath, plainText, programName, splitHost } from './names'
+import { absolutePath, cacheFolder, folderTarget, isGuardedPath, plainText, programName, splitHost } from './names'
 import { recordKey } from './records'
 
 type Counter = 'blocked' | 'listed' | 'inferred'
@@ -45,6 +45,8 @@ const LINUX_WRITE = /^deny [a-z0-9_]+ (\/.*)$/
 const REPORT_START = /^(?:deny |\S+\(\d+\) )/
 const EXIT_CODE = /^Exit code \d+/
 const PERMISSION_ERROR = /operation not permitted|read-only file system/i
+// An error of mkdir, BSD or GNU: the path that it names is the folder that it tried to create.
+const MKDIR_ERROR = /^mkdir: /
 const SOCKET_WORDS = /\b(?:listen|connect|socket)\b/i
 const PATH_START = /(?:^|[\s'"‘`(])\/(?!\/)/g
 const PATH_CANDIDATE = /(?:^|[\s'"‘`(])(\/(?!\/)[^\s'"’`:,)]+)(?=[:'"’`,)]|$)/g
@@ -100,9 +102,18 @@ function hostSighting(text: string, counter: 'blocked' | 'listed', reason: Block
   return { kind: 'host', target: host, counter, reason, reasonText, ports: port === null ? [] : [port], detail: hostDetail(host, port), program }
 }
 
-function pathSighting(path: string, counter: 'blocked' | 'inferred', home: string | undefined, program: string): Sighting {
+/** A write-folder sighting. Its target is the folder that `folderTarget` names, of a folder path when `isFolder`. */
+function pathSighting(path: string, counter: 'blocked' | 'inferred', home: string | undefined, program: string, isFolder = false): Sighting {
   const reason: BlockReason = counter === 'blocked' ? 'write' : 'inferred'
-  return { kind: 'path', target: folderTarget(path, home), counter, reason, reasonText: '', ports: [], detail: path, program }
+  return { kind: 'path', target: folderTarget(path, home, isFolder), counter, reason, reasonText: '', ports: [], detail: path, program }
+}
+
+/**
+ * A write-folder sighting guessed from error text. Its path names a folder when mkdir tried to create it, and when it
+ * names a cache folder itself, such as `~/.cache/tool`: so the target is never a whole cache root.
+ */
+function guessedSighting(path: string, line: string, home: string | undefined, program: string): Sighting {
+  return pathSighting(path, 'inferred', home, program, MKDIR_ERROR.test(line) || cacheFolder(path, home, true) === path)
 }
 
 function reportLines(sources: readonly string[]): string[] {
@@ -193,7 +204,7 @@ export function readCall(call: BashCall, outcome: BashOutcome, home: string | un
   const inferred = canInfer
     ? capPaths(sources.flatMap(source => source.split('\n')).flatMap(line => {
         const path = inferredPath(line, cwd)
-        return path === null ? [] : [pathSighting(path, 'inferred', home, program)]
+        return path === null ? [] : [guessedSighting(path, line, home, program)]
       }))
     : []
   // The command of a failed call can print a block at the end of its text: it counts only while the sandbox ran the call.
