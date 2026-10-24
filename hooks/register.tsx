@@ -3,10 +3,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HookFailure, Register, RenderElement, Timer, ToolCallResult } from 'claude-code'
 
-import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
+import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerLineage, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
 import { KeyFailure, causeOf, diagnostic, shownCause } from './diagnostics'
 import { TMP, absolutePath, commandLine, cutText, displayPath, isTempFolder, isUnder, pathFolders, plainText } from './names'
-import { JOURNAL_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, mergeSighting, recordKey, seenIn, shownRecords } from './records'
+import { JOURNAL_PREFIX, LINEAGE_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isLineage, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, keptBranches, keysSeenBy, lineageStep, mergeSighting, recordKey, seenIn, shownRecords } from './records'
+import type { Lineage } from './records'
 import { addEntry, fileInfo, isApplied, lockText, parseSettings, readLock, removeEntry, serializeSettings } from './settings-file'
 import type { FileInfo, ParsedSettings } from './settings-file'
 import { keepGated, latestOf, readCall, reportQuote } from './sightings'
@@ -44,6 +45,56 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
   const run = queue.then(job)
   queue = run.catch(() => undefined)
   return run
+}
+
+// With scope session, the session that classic.SessionStart starts at /clear, /resume, or /branch, while its dispatch
+// runs (whileStarting). The settings SessionStart hooks run beneath the mods in that dispatch, and until it ends,
+// $.session.id() still names the session before at /resume and /branch. One per module instance, as the queue.
+let starting: string | null = null
+
+/** The current session: the one that classic.SessionStart starts while its dispatch runs (starting), else $.session.id(). */
+async function sessionNow($: EngineInterface): Promise<string> {
+  return starting ?? (await $.session.id())
+}
+
+/** Runs the dispatch of classic.SessionStart with `session`, the session that it starts, as the current one (sessionNow). */
+async function whileStarting<T>(session: string, dispatch: () => Promise<T>): Promise<T> {
+  starting = session
+  try {
+    return await dispatch()
+  } finally {
+    // A switch that started during this dispatch owns the value now.
+    if (starting === session) starting = null
+  }
+}
+
+// With scope session, the branches in this process that could not keep the refusal of Allow and Deny after a sighting
+// that their parent could not save (keepRefusal). Claude Code resets $.state at a switch, so they live here. One per
+// module instance, as the queue.
+const unrestored = new Set<string>()
+
+/**
+ * A /branch with scope session whose record waits in the module queue (saveLineage): its parent, its time, and the
+ * targets that the parent saw by that time, once read (keepBranchKeys), or the error of that read.
+ */
+type WaitingBranch = { parent: string; at: number; seen: { keys: string[] } | { error: unknown } | null }
+// The waiting /branch records, by branch. One per module instance, as the queue.
+const waiting = new Map<string, WaitingBranch>()
+
+/**
+ * Before a sighting of `session` at `now` is saved, reads the targets that it saw by the time of each waiting /branch
+ * from it that came before `now`. A Bash call that ended before /branch can wait in the queue, and its sightings came
+ * after the branch: the branch does not inherit them.
+ */
+async function keepBranchKeys($: EngineInterface, session: string | null, now: number): Promise<void> {
+  for (const branch of waiting.values()) {
+    if (branch.parent !== session || now <= branch.at || branch.seen !== null) continue
+    try {
+      branch.seen = { keys: keysSeenBy(await readWriterRecords($), session, branch.at) }
+    } catch (error) {
+      branch.seen = { error }
+    }
+  }
 }
 
 /**
@@ -95,7 +146,7 @@ type Origin = { session: string } | { session: null; cause: string }
 /** Reads the session of a press or a tool call when it starts, before it waits for the call or the module queue. */
 async function sessionOrigin($: EngineInterface): Promise<Origin> {
   try {
-    return { session: await $.session.id() }
+    return { session: await sessionNow($) }
   } catch (error) {
     return { session: null, cause: causeOf(error) }
   }
@@ -191,6 +242,7 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: C
   if (sightings.length === 0) return
   const sessionId = await sessionIdOf($, tool, origin, isShown)
   const now = await $.clock.now()
+  await keepBranchKeys($, sessionId, now)
   for (const sighting of sightings) {
     if (signal.aborted) return
     await saveSighting($, scope, sighting, sessionId, now, tool, isShown)
@@ -199,11 +251,8 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: C
   if (newest !== null && isShown) await update($, latest, () => newest)
 }
 
-/**
- * Read durable evidence before displaying it or authorizing a new grant. With `sessionId`, only the targets that a
- * sighting of that session named, each with the sightings of every session.
- */
-async function readRecords($: EngineInterface, targetKey?: string, sessionId?: string): Promise<SandboxTunerRecord[]> {
+/** Every writer's saved record, of `targetKey` only when given. A record that is not valid fails the read. */
+async function readWriterRecords($: EngineInterface, targetKey?: string): Promise<SandboxTunerRecord[]> {
   const found: SandboxTunerRecord[] = []
   for (const key of await $.store.keys()) {
     if (!key.startsWith(WRITER_PREFIX)) continue
@@ -217,7 +266,16 @@ async function readRecords($: EngineInterface, targetKey?: string, sessionId?: s
     }
     found.push(value)
   }
-  const combined = aggregateRecords(sessionId === undefined ? found : seenIn(found, sessionId))
+  return found
+}
+
+/**
+ * Read durable evidence before displaying it or authorizing a new grant. With `lineage`, only the targets that a
+ * session of the lineage saw by its time (seenIn), each with the sightings of every session.
+ */
+async function readRecords($: EngineInterface, targetKey?: string, lineage?: readonly Lineage[]): Promise<SandboxTunerRecord[]> {
+  const found = await readWriterRecords($, targetKey)
+  const combined = aggregateRecords(lineage === undefined ? found : seenIn(found, lineage))
   for (const record of combined) {
     const hidden = await $.store.get(HIDDEN_PREFIX + record.key)
     if (hidden !== undefined && typeof hidden !== 'boolean') throw new KeyFailure('invalid hidden preference', record.key)
@@ -227,14 +285,88 @@ async function readRecords($: EngineInterface, targetKey?: string, sessionId?: s
 }
 
 /**
+ * The sessions whose sightings and changes the view of `session` shows with scope session: the session itself, then
+ * each session that it branched from, with the targets that it saw by that branch and up to the time of that branch,
+ * at most 10 steps up (lineageStep). A branch record that cannot be read or is not valid ends the walk, and the debug
+ * log says why: the view then shows less.
+ */
+async function lineageOf($: EngineInterface, session: string, event: string, detail: string | null): Promise<Lineage[]> {
+  const lineage: Lineage[] = [{ session, until: Number.POSITIVE_INFINITY, keys: null }]
+  for (let child = session; ;) {
+    const key = LINEAGE_PREFIX + child
+    let found: unknown
+    try {
+      found = await $.store.get(key)
+    } catch (error) {
+      logDebug($, diagnostic(event, detail, `could not read the branch record ${key}: ${causeOf(error)}`))
+      return lineage
+    }
+    if (found === undefined) return lineage
+    if (!isLineage(found, child)) {
+      logDebug($, diagnostic(event, detail, `skipped a branch record that is not valid: ${key}`))
+      return lineage
+    }
+    const step = lineageStep(lineage, found)
+    if (step === null) return lineage
+    lineage.push(step)
+    child = step.session
+  }
+}
+
+/** The lineage of the current session (sessionNow, lineageOf). */
+async function currentLineage($: EngineInterface, event: string, detail: string | null): Promise<Lineage[]> {
+  return lineageOf($, await sessionNow($), event, detail)
+}
+
+/**
+ * Keeps the refusal of Allow and Deny in the branch `session`, whose parent could not save a sighting. While $.state
+ * refuses it, the branch stays in `unrestored`: Allow and Deny refuse, and a load shows no target that the branch
+ * inherited (targetLineage). Returns why it could not keep the refusal, or null.
+ */
+async function keepRefusal($: EngineInterface, session: string): Promise<string | null> {
+  try {
+    await update($, evidenceIncomplete, () => true)
+    unrestored.delete(session)
+    return null
+  } catch (error) {
+    unrestored.add(session)
+    return causeOf(error)
+  }
+}
+
+/**
+ * The lineage whose targets a load shows: only the current session while it, or a session of its lineage, could not
+ * keep the refusal of its parent (unrestored). Each load tries to keep the refusal in the current session, and once one
+ * does, the branch shows what it inherited.
+ */
+async function targetLineage($: EngineInterface, event: string, detail: string | null, lineage: readonly Lineage[]): Promise<readonly Lineage[]> {
+  const [own] = lineage
+  if (own === undefined || !lineage.some(item => unrestored.has(item.session))) return lineage
+  const cause = await keepRefusal($, own.session)
+  if (cause === null) return lineage
+  logDebug($, diagnostic(event, detail, `could not keep the refusal after a sighting that the session before could not save, so the branch shows no target of it: ${cause}`))
+  return [own]
+}
+
+/**
+ * Whether the current session, or a session of its lineage, is a branch that could not keep the refusal of its parent
+ * (unrestored). Also when the lineage cannot be read then.
+ */
+async function isUnrestored($: EngineInterface, buttonKey: string): Promise<boolean> {
+  if (unrestored.size === 0) return false
+  return currentLineage($, 'ui.press', buttonKey).then(lineage => lineage.some(item => unrestored.has(item.session)), () => true)
+}
+
+/**
  * Display retention never deletes another writer's mutable safety evidence. With scope session, the display keeps only
- * the targets of the session that $.session.id() names now, and a problem names no saved key (shownCause). Returns the
- * targets, or the problem as the report shows it.
+ * the targets of the lineage of the current session (currentLineage), and a problem names no saved key (shownCause).
+ * Returns the targets, or the problem as the report shows it.
  */
 async function loadSaved($: EngineInterface, scope: SandboxTunerScope, event: string, detail: string | null): Promise<SandboxTunerRecord[] | string> {
   try {
-    const found = await readRecords($, undefined, scope === 'session' ? await $.session.id() : undefined)
-    const journal = journalOf(await reconcileJournal($, scope, await readJournal($)))
+    const lineage = scope === 'all' ? undefined : await currentLineage($, event, detail)
+    const found = await readRecords($, undefined, lineage === undefined ? undefined : await targetLineage($, event, detail, lineage))
+    const journal = journalOf(await reconcileJournal($, scope, await readJournal($), lineage))
     const kept = shownRecords(found, await $.clock.now())
     await update($, records, () => kept)
     await update($, applied, () => journal)
@@ -683,14 +815,15 @@ type Granted = { entry: string; files: string[] }
 type Advice = { hasUndo: boolean; byHand: string[] }
 
 /**
- * The rows of the Applied list, as the pane shows them: with scope session, only the edits of the current session. The
- * pane cannot draw that list without the session id, so then no row has an Undo, and each warning names the file.
+ * The rows of the Applied list, as the pane shows them: with scope session, only the edits of the lineage of the current
+ * session. The pane cannot draw that list without the session id, so then no row has an Undo, and each warning names
+ * the file.
  */
 async function listedRows($: EngineInterface, scope: SandboxTunerScope, event: RecheckEvent, journal: readonly SandboxTunerApplied[]): Promise<SandboxTunerApplied[]> {
   const rows = journalOf(journal)
   if (scope === 'all') return rows
   try {
-    return appliedIn(rows, await $.session.id())
+    return appliedIn(rows, await currentLineage($, event, null))
   } catch (error) {
     logDebug($, diagnostic(event, null, `could not read the session id, so each warning names the settings file to edit: ${causeOf(error)}`))
     return []
@@ -1031,7 +1164,7 @@ async function editSettings($: EngineInterface, buttonKey: string, file: FileInf
 
 /** The saved record of a target, read again from every writer, or the result of a press that stops. */
 async function targetRecord($: EngineInterface, key: string, buttonKey: string): Promise<SandboxTunerRecord | PressResult> {
-  if (await read($, evidenceIncomplete)) return failure(buttonKey, 'some sightings could not be saved. Durable safety evidence is incomplete. Nothing was written.')
+  if ((await read($, evidenceIncomplete)) || (await isUnrestored($, buttonKey))) return failure(buttonKey, 'some sightings could not be saved. Durable safety evidence is incomplete. Nothing was written.')
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
 
@@ -1044,7 +1177,7 @@ async function pressStop($: EngineInterface, scope: SandboxTunerScope, origin: O
   if (scope === 'all') return null
   if (origin.session === null) return `could not read the session id: ${origin.cause}. Nothing was written.`
   try {
-    return (await $.session.id()) === origin.session ? null : 'another session started after this press. Nothing was written.'
+    return (await sessionNow($)) === origin.session ? null : 'another session started after this press. Nothing was written.'
   } catch (error) {
     return `could not read the session id: ${causeOf(error)}. Nothing was written.`
   }
@@ -1105,12 +1238,90 @@ async function dismissPress($: EngineInterface, key: string): Promise<null> {
   return null
 }
 
+/** The band of a session as it ended: its latest block and its dismissal (session.end). */
+type Band = { latest: SandboxTunerLatest | null; dismissed: string | null }
 /**
- * Loads the saved targets for a session that /clear, /resume, or /branch started in this process. With scope session,
- * nothing of the session before stays first: not its targets, so that a load that fails shows none, its band, its
- * notice, its dismissal, its last background problem, which can name its targets, or the place in its Applied list.
+ * The session that ended last in this process, with its band, or with no band when it could not be read, and whether
+ * a sighting of it could not be saved (`isIncomplete`, also when that could not be read).
  */
-async function startSession($: EngineInterface, scope: SandboxTunerScope): Promise<void> {
+type Ended = { session: string; band: Band | null; isIncomplete: boolean }
+/**
+ * A /branch with scope session: the branch (`session`, the id of its classic.SessionStart), the session that it
+ * started from (null when unknown), the time of the branch, the band of that session, and whether a sighting of that
+ * session could not be saved.
+ */
+type Fork = { session: string; parent: string | null; at: number; band: Band | null; isIncomplete: boolean }
+
+/**
+ * The /branch that classic.SessionStart with source fork starts. Its parent is the session whose session.end came
+ * right before (`ended`). With no such session.end, it is the session that $.session.id() names: during this hook, it
+ * still names the session before the branch. Its record waits in the module queue from the time of the branch (waiting).
+ */
+async function forkOf($: EngineInterface, session: string, ended: Ended | null): Promise<Fork> {
+  const parent = ended?.session ?? (await $.session.id().catch(() => null))
+  const at = await $.clock.now()
+  const isIncomplete = ended?.isIncomplete ?? false
+  if (parent === session) return { session, parent: null, at, band: null, isIncomplete }
+  if (parent !== null) waiting.set(session, { parent, at, seen: null })
+  return { session, parent, at, band: ended?.band ?? null, isIncomplete }
+}
+
+/**
+ * Saves the lineage record of a /branch, with the targets that a record named its parent in by the time of the branch
+ * (keepBranchKeys), so that the branch shows what its parent saw and applied before it. Then, past 200 branch records,
+ * it removes the oldest that no view needs (pruneBranches). A problem names no saved key (shownCause).
+ */
+async function saveLineage($: EngineInterface, scope: SandboxTunerScope, fork: Fork): Promise<void> {
+  const failed = 'The branch shows only what it sees and changes itself.'
+  const seen = waiting.get(fork.session)?.seen ?? null
+  waiting.delete(fork.session)
+  if (fork.parent === null) {
+    logDebug($, diagnostic('classic.SessionStart', 'fork', `found no session that /branch started from. ${failed}`))
+    return
+  }
+  let found: SandboxTunerRecord[]
+  try {
+    if (seen !== null && 'error' in seen) throw seen.error
+    found = await readWriterRecords($)
+    const record: SandboxTunerLineage = { session: fork.session, parent: fork.parent, at: fork.at, keys: seen?.keys ?? keysSeenBy(found, fork.parent, fork.at) }
+    await $.store.set(LINEAGE_PREFIX + fork.session, record)
+  } catch (error) {
+    const problem = (cause: string) => diagnostic('classic.SessionStart', 'fork', `could not save the session that /branch started from: ${cause}. ${failed}`)
+    await noteFault($, problem(causeOf(error)), problem(shownCause(scope, error)))
+    return
+  }
+  await pruneBranches($, fork.session, found)
+}
+
+/**
+ * Past 200 branch records, removes the oldest that no view needs (keptBranches), after the record of the branch
+ * `current` is saved, with `found`, the target records of every writer. A record that is not valid stays and does not
+ * count: Sandbox Tuner cannot tell what it holds. A problem goes to the debug log, and every record stays.
+ */
+async function pruneBranches($: EngineInterface, current: string, found: readonly SandboxTunerRecord[]): Promise<void> {
+  try {
+    const branches: SandboxTunerLineage[] = []
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(LINEAGE_PREFIX)) continue
+      const value = await $.store.get(key)
+      if (isLineage(value, key.slice(LINEAGE_PREFIX.length))) branches.push(value)
+    }
+    const changed = (await readJournal($)).flatMap(entry => (entry.session === undefined ? [] : [entry.session]))
+    const kept = keptBranches(branches, new Set([...found.flatMap(record => record.sessions), ...changed]), current)
+    for (const branch of branches) if (!kept.has(branch.session)) await $.store.delete(LINEAGE_PREFIX + branch.session)
+  } catch (error) {
+    logDebug($, diagnostic('classic.SessionStart', 'fork', `could not remove the branch records that no view needs: ${causeOf(error)}`))
+  }
+}
+
+/**
+ * Loads the saved targets for the session that /clear, /resume, or /branch started in this process (sessionNow). With
+ * scope session, nothing of the session before stays first: not its targets, so that a load that fails shows none, its
+ * band, its notice, its dismissal, its last background problem, which can name its targets, or the place in its Applied
+ * list. A /branch (`fork`) then saves its lineage record, takes the band, the dismissal, and a failed sighting save of
+ * its parent back, and loads the view of the branch: what it inherits, and later what it adds.
+ */
+async function startSession($: EngineInterface, scope: SandboxTunerScope, fork: Fork | null): Promise<void> {
   if (scope === 'session') {
     const clears: (() => Promise<unknown>)[] = [
       () => update($, records, () => []),
@@ -1125,6 +1336,25 @@ async function startSession($: EngineInterface, scope: SandboxTunerScope): Promi
     for (const clear of clears) await clear().catch((error: unknown) => problems.push(causeOf(error)))
     if (problems.length > 0) await noteFault($, diagnostic('classic.SessionStart', null, `could not clear what the session before showed: ${problems.join('; ')}`))
   }
+  if (fork === null) {
+    await loadSaved($, scope, 'classic.SessionStart', null)
+    return
+  }
+  if (fork.isIncomplete) {
+    // The branch shows the targets of its parent: Allow and Deny refuse there too.
+    const cause = await keepRefusal($, fork.session)
+    if (cause !== null) await noteFault($, diagnostic('classic.SessionStart', 'fork', `could not keep the refusal after a sighting that the session before could not save: ${cause}. Allow and Deny refuse, and the branch shows no target of the session before until a later load, such as /sandbox-tuner, keeps the refusal.`))
+  }
+  await saveLineage($, scope, fork)
+  const { band } = fork
+  if (band !== null) {
+    try {
+      await update($, latest, () => band.latest)
+      await update($, dismissed, () => band.dismissed)
+    } catch (error) {
+      await noteFault($, diagnostic('classic.SessionStart', 'fork', `could not show the band of the session that /branch started from: ${causeOf(error)}`))
+    }
+  }
   await loadSaved($, scope, 'classic.SessionStart', null)
 }
 
@@ -1138,7 +1368,7 @@ async function isSessionNow($: EngineInterface, scope: SandboxTunerScope, sessio
   if (scope === 'all') return true
   if (session === null || session === undefined) return false
   try {
-    return (await $.session.id()) === session
+    return (await sessionNow($)) === session
   } catch {
     return false
   }
@@ -1244,12 +1474,13 @@ async function readJournal($: EngineInterface): Promise<SandboxTunerApplied[]> {
 
 /**
  * Reconcile uncertain edits without writing settings, including after a reload. With scope session, the pane shows the
- * problem with a change of another session in general words, and the debug log names the change.
+ * problem with a change outside the lineage of the current session (`lineage`, else read at the first problem) in
+ * general words, and the debug log names the change.
  */
-async function reconcileJournal($: EngineInterface, scope: SandboxTunerScope, journal: readonly SandboxTunerApplied[]): Promise<SandboxTunerApplied[]> {
+async function reconcileJournal($: EngineInterface, scope: SandboxTunerScope, journal: readonly SandboxTunerApplied[], lineage?: readonly Lineage[]): Promise<SandboxTunerApplied[]> {
   const reconciled: SandboxTunerApplied[] = []
-  // The current session, read at the first problem: null when it cannot be read.
-  let current: string | null | undefined
+  // The lineage of the current session: null when it cannot be read.
+  let current: readonly Lineage[] | null | undefined = lineage
   for (const entry of journal) {
     const isAddition = entry.applyState === 'pending'
     if (!isAddition && !isUndoUnresolved(entry)) { reconciled.push(entry); continue }
@@ -1264,8 +1495,8 @@ async function reconcileJournal($: EngineInterface, scope: SandboxTunerScope, jo
       } catch (error) {
         const event = isAddition ? 'apply.confirm' : 'undo.confirm'
         const text = diagnostic(event, entry.id, causeOf(error))
-        if (scope === 'session' && current === undefined) current = await $.session.id().catch(() => null)
-        const isShown = scope === 'all' || (current !== null && entry.session === current)
+        if (scope === 'session' && current === undefined) current = await currentLineage($, event, null).catch(() => null)
+        const isShown = scope === 'all' || (current !== null && current !== undefined && appliedIn([entry], current).length > 0)
         await noteFault($, text, isShown ? text : diagnostic(event, null, `could not confirm ${isAddition ? 'an addition' : 'an Undo'} that another session made. The debug log names it and the cause.`))
       }
     }
@@ -1292,14 +1523,17 @@ async function undoFix($: EngineInterface, scope: SandboxTunerScope, id: string,
   return editSettings($, buttonKey, file, { kind: 'remove', entry }, () => pressStop($, scope, origin))
 }
 
-/** The rows of the Applied list: with scope session, only the edits that a press of the current session saved. */
-async function shownJournal($: EngineInterface, scope: SandboxTunerScope): Promise<SandboxTunerApplied[]> {
+/**
+ * The rows of the Applied list: with scope session, only the edits that a press of the lineage of the current session
+ * saved by its time.
+ */
+async function shownJournal($: EngineInterface, scope: SandboxTunerScope, event: string): Promise<SandboxTunerApplied[]> {
   const journal = await read($, applied)
-  return scope === 'all' ? journal : appliedIn(journal, await $.session.id())
+  return scope === 'all' ? journal : appliedIn(journal, await currentLineage($, event, null))
 }
 
 async function moveApplied($: EngineInterface, scope: SandboxTunerScope, delta: number): Promise<null> {
-  const last = Math.max(0, (await shownJournal($, scope)).length - 1)
+  const last = Math.max(0, (await shownJournal($, scope, 'ui.press')).length - 1)
   await update($, appliedOffset, offset => Math.max(0, Math.min(last, Math.min(offset, last) + delta)))
   return null
 }
@@ -1328,6 +1562,9 @@ export const register: Register = (on, options) => {
   let isInteractive = false
   // The timer of the timed check: one for the process, across /clear. A hot reload cancels it with the old module.
   let linkTimer: Timer | null = null
+  // With scope session, the session that ended last, for a /branch that follows (forkOf). It lives outside $.state:
+  // Claude Code resets $.state between session.end and classic.SessionStart. The next classic.SessionStart takes it.
+  let ended: Ended | null = null
   // A hot reload runs session.start again: it registers the command again and loads the store again.
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -1348,11 +1585,40 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // /clear, /resume, and /branch start a new session in the same process, and session.start does not fire.
-  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    await enqueue(() => startSession($, scope))
-    if (isInteractive) void recheckOnce($, threshold, scope, true)
+  // /clear, /resume, and /branch end the session first, while $.state still holds its values. The snapshot waits for no
+  // queue: the end has a short time bound.
+  on('session.end', async ($, e, next) => {
+    if (scope === 'session') {
+      const session = e.sessionId
+      // A band that cannot be read stays behind, and the branch still gets its lineage record. A flag that cannot be
+      // read counts as a failed sighting save, so that Allow and Deny refuse in the branch, and so does a refusal that
+      // the session could not keep (unrestored).
+      ended = { session, band: null, isIncomplete: true }
+      const isIncomplete = unrestored.has(session) || (await read($, evidenceIncomplete))
+      ended = { session, band: null, isIncomplete }
+      const band: Band = { latest: await read($, latest), dismissed: await read($, dismissed) }
+      ended = { session, band, isIncomplete }
+    }
     return next(e)
+  }).catch(($, e, next) => {
+    hookFailed($, 'session.end', null, next.error)
+    return next(e)
+  })
+
+  // /clear, /resume, and /branch start a new session in the same process, and session.start does not fire. During this
+  // hook and the settings SessionStart hooks beneath it (next), $.session.id() still names the session before at
+  // /branch and /resume. With scope session, the whole dispatch takes the id of the event as the current session, so
+  // that a press or a call in it counts for the session that the band and the pane show (whileStarting).
+  on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
+    const before = ended
+    ended = null
+    const dispatch = async () => {
+      const fork = scope === 'session' && e.source === 'fork' ? await forkOf($, e.session_id, before) : null
+      await enqueue(() => startSession($, scope, fork))
+      if (isInteractive) void recheckOnce($, threshold, scope, true)
+      return next(e)
+    }
+    return scope === 'session' ? whileStarting(e.session_id, dispatch) : dispatch()
   }).catch(($, e, next) => {
     hookFailed($, 'classic.SessionStart', null, next.error)
     return next(e)
@@ -1413,7 +1679,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const context = await loadContext($, threshold, 'ui.render (Pane)')
-    const journal = await shownJournal($, scope)
+    const journal = await shownJournal($, scope, 'ui.render (Pane)')
     const now = await $.clock.now()
     const model = buildPane({
       // Sightings of this session join $.state without a load, so each drawing applies the display limits again.
