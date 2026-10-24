@@ -21,6 +21,10 @@ export type SandboxTunerRecord = {
   isHidden: boolean
 }
 
+// One /branch with scope session, saved under `lineage:<session>`: the branch, the session that it started from, the
+// time of the branch, and the keys of the targets that a record named that session in by then, sorted.
+export type SandboxTunerLineage = { session: string; parent: string; at: number; keys: string[] }
+
 export type SandboxTunerAction = 'allow' | 'deny'
 
 export type SandboxTunerSettingsKey =
@@ -45,7 +49,8 @@ export type SandboxTunerApplied = {
 }
 
 // The `scope` option: what the band, the pane, and the report show. `session`, only what the current session saw and
-// applied; `all`, what every session saw and applied.
+// applied, with what each session that it branched from saw and applied before the branch; `all`, what every session
+// saw and applied.
 export type SandboxTunerScope = 'session' | 'all'
 
 export type SandboxTunerLatest = {

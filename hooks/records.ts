@@ -1,6 +1,6 @@
-// Saved records: store keys, the merge of a sighting, counts, shape, retention.
+// Saved records: store keys, the merge of a sighting, counts, shape, retention, and the lineage of a branch.
 
-import type { SandboxTunerApplied, SandboxTunerCounts, SandboxTunerLatest, SandboxTunerRecord } from '../types'
+import type { SandboxTunerApplied, SandboxTunerCounts, SandboxTunerLatest, SandboxTunerLineage, SandboxTunerRecord } from '../types'
 import { isGuardedPath, normalHost } from './names'
 import { isCount, isListOf, isPlainObject, isText } from './shapes'
 import type { Sighting } from './sightings'
@@ -9,7 +9,12 @@ import type { Sighting } from './sightings'
 export const WRITER_PREFIX = 'writer:'
 export const HIDDEN_PREFIX = 'hidden:'
 export const JOURNAL_PREFIX = 'applied:'
+export const LINEAGE_PREFIX = 'lineage:'
 const JOURNAL_LIMIT = 50
+// The most steps that a view follows up from a branch to the sessions that it started from.
+const LINEAGE_LIMIT = 10
+// The most branch records that the store keeps (keptBranches).
+const BRANCH_LIMIT = 200
 
 const RECORD_LIMIT = 300
 const RECORD_AGE_MS = 30 * 24 * 60 * 60 * 1000
@@ -102,15 +107,77 @@ export function shownRecords(records: readonly SandboxTunerRecord[], now: number
   return records.filter(record => !stale.has(record.key))
 }
 
-/** Every writer's record of each target that a record of `sessionId` names: so the counts keep every session. */
-export function seenIn(records: readonly SandboxTunerRecord[], sessionId: string): SandboxTunerRecord[] {
-  const keys = new Set(records.filter(record => record.sessions.includes(sessionId)).map(record => record.key))
+/**
+ * A session that a view shows with scope session, and up to when: the current session with no end (`until` Infinity)
+ * and each target that a record names it in (`keys` null), then each session that it branched from, up to the time of
+ * that branch, with the targets that the branch record holds (lineageStep).
+ */
+export type Lineage = { session: string; until: number; keys: ReadonlySet<string> | null }
+
+/** Whether a value is the record of the /branch that started `session` (LINEAGE_PREFIX). */
+export function isLineage(value: unknown, session: string): value is SandboxTunerLineage {
+  return isPlainObject(value) && value.session === session && isText(value.parent) && isCount(value.at) && isListOf(value.keys, isText)
+}
+
+/**
+ * The next step of a lineage up: the session that the branch of the last session started from, with the targets that
+ * it saw by that branch, up to the time of that branch or of any branch below it, whichever is first. Null after 10
+ * steps, and when the step leads to a session of the lineage again.
+ */
+export function lineageStep(lineage: readonly Lineage[], branch: SandboxTunerLineage): Lineage | null {
+  const last = lineage[lineage.length - 1]
+  if (last === undefined || lineage.length > LINEAGE_LIMIT || lineage.some(item => item.session === branch.parent)) return null
+  return { session: branch.parent, until: Math.min(last.until, branch.at), keys: new Set(branch.keys) }
+}
+
+/**
+ * The targets that a record of `session` names by `at`, the time of a /branch from that session, each once and sorted:
+ * what the branch record of that /branch keeps, so that a target record holds no time for each session. A record first
+ * seen after `at` saw `session` after it too. A record that names other sessions keeps no time of `session`, so it
+ * counts when it was first seen by `at`.
+ */
+export function keysSeenBy(records: readonly SandboxTunerRecord[], session: string, at: number): string[] {
+  return [...new Set(records.filter(record => record.sessions.includes(session) && record.firstSeen <= at).map(record => record.key))].sort()
+}
+
+/**
+ * The sessions whose branch records the store keeps after the /branch that started `current`: every one while there
+ * are 200 or fewer. Past 200, the oldest go first, but never the record of `current` or of a branch that a target record
+ * or an Undo journal entry names (`named`), nor the 9 records above each of those, which its view walks (lineageStep).
+ * So more than 200 stay when those alone pass 200.
+ */
+export function keptBranches(branches: readonly SandboxTunerLineage[], named: ReadonlySet<string>, current: string): Set<string> {
+  const kept = new Set(branches.map(branch => branch.session))
+  if (kept.size <= BRANCH_LIMIT) return kept
+  const bySession = new Map(branches.map(branch => [branch.session, branch]))
+  const needed = new Set<string>()
+  // Each walk takes all its steps: another walk can reach a record with fewer steps left.
+  const keep = (session: string) => {
+    let next = bySession.get(session)
+    for (let step = 0; next !== undefined && step < LINEAGE_LIMIT; step += 1, next = bySession.get(next.parent)) needed.add(next.session)
+  }
+  keep(current)
+  for (const branch of branches) if (named.has(branch.session)) keep(branch.session)
+  const oldest = branches.filter(branch => !needed.has(branch.session))
+    .sort((a, b) => a.at - b.at || (a.session < b.session ? -1 : a.session > b.session ? 1 : 0))
+  for (const branch of oldest.slice(0, kept.size - BRANCH_LIMIT)) kept.delete(branch.session)
+  return kept
+}
+
+/** Whether a session of the lineage saw a target: by a record that names it, or by the branch record of the step. */
+function isSeenBy(record: SandboxTunerRecord, { session, keys }: Lineage): boolean {
+  return keys === null ? record.sessions.includes(session) : keys.has(record.key)
+}
+
+/** Every writer's record of each target that a session of the lineage saw by its time: so the counts keep every session. */
+export function seenIn(records: readonly SandboxTunerRecord[], lineage: readonly Lineage[]): SandboxTunerRecord[] {
+  const keys = new Set(records.filter(record => lineage.some(item => isSeenBy(record, item))).map(record => record.key))
   return records.filter(record => keys.has(record.key))
 }
 
-/** The journal entries that a press of `sessionId` saved. An entry of Sandbox Tuner 1.1.3 names no session. */
-export function appliedIn(journal: readonly SandboxTunerApplied[], sessionId: string): SandboxTunerApplied[] {
-  return journal.filter(entry => entry.session === sessionId)
+/** The journal entries that a press of a session of the lineage saved by its time. An entry of Sandbox Tuner 1.1.3 names no session. */
+export function appliedIn(journal: readonly SandboxTunerApplied[], lineage: readonly Lineage[]): SandboxTunerApplied[] {
+  return journal.filter(entry => lineage.some(item => entry.session === item.session && entry.appliedAt <= item.until))
 }
 
 /** The 50 newest history entries plus every unresolved edit, oldest first. */

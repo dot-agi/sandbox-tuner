@@ -52,7 +52,7 @@ claude plugin list --json | jq -r '.[] | select(.id == "sandbox-tuner@sandbox-tu
 | `hooks/verdicts.ts` | The verdict of each target against the current settings. |
 | `hooks/settings-file.ts` | Parses, edits, and serializes the user settings file, formats and parses the record of its lock file, and checks the shape of a journal entry. |
 | `hooks/sightings.ts` | Reads one Bash call into sightings. |
-| `hooks/records.ts` | The saved records and the journal: store keys, merge, shape, retention, and the band's fixed-since rule. |
+| `hooks/records.ts` | The saved records and the journal: store keys, merge, shape, retention, the band's fixed-since rule, and the lineage of a branch. |
 | `hooks/names.ts` | The naming rules for hosts, paths, cache folders, protected names, and commands. |
 | `hooks/shapes.ts` | JSON shape checks. |
 | `hooks/diagnostics.ts` | The diagnostic form, and the cause that the band, the pane, and the report show with `scope: session`. |
@@ -73,7 +73,7 @@ Run them from the repository folder:
 - Every `$` call is in `hooks/register.tsx`, written in full. `$` goes only to top-level functions of that file and to `read` and `update`.
 - Every sentence of the band, the pane, the report, the command, and the notices comes from `hooks/words.ts`. The cause of a diagnostic is written where the failure happens.
 - Every failure path gives a diagnostic of the form `sandbox-tuner: <event> (<detail>): <cause>`, built by `diagnostic` in `hooks/diagnostics.ts`.
-- Session values live in `$.state`. Values that outlive the session live in `$.store`, independent keys for each target and writer, separate Hide preferences, and one key per journal entry. Never delete another writer’s mutable evidence. Refresh durable evidence before a settings edit.
+- Session values live in `$.state`. Values that outlive the session live in `$.store`, independent keys for each target and writer, separate Hide preferences, one key per journal entry, and one key per branch. Claude Code resets `$.state` at `/clear`, `/resume`, and `/branch`, so a value that must cross that switch lives outside it, in the `register` closure or at the top of the module, such as the branches that could not keep a refusal (`unrestored`) and the branch records that wait in the queue (`waiting`). During the dispatch of `classic.SessionStart`, with the settings hooks beneath it, `$.session.id()` still names the session before at `/resume` and `/branch`, so read the current session with `sessionNow`. Never delete another writer’s mutable evidence. Refresh durable evidence before a settings edit.
 - A `ui.render` hook never writes state. One dispatch reads `$.state` at one moment, so never `read` a value right after you `update` it in the same dispatch.
 - Compare paths only after `absolutePath` in `hooks/names.ts` resolved them. A folder Allow is rated again where the folder and every guarded place really lie (`checkRealFolder`), because a spelling can hide a link. The link walk skips the data folders of the config folder, and reads only two levels of each installed plugin and VS Code extension (`guardedWalks` in `hooks/verdicts.ts`).
 - The pane keeps its drawing under the engine's text bound: each list stops at 25 rows or at the text budget in `hooks/views.tsx`.
