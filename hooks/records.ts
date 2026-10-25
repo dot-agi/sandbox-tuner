@@ -10,6 +10,12 @@ export const WRITER_PREFIX = 'writer:'
 export const HIDDEN_PREFIX = 'hidden:'
 export const JOURNAL_PREFIX = 'applied:'
 export const LINEAGE_PREFIX = 'lineage:'
+// One key per session in which Allow and Deny refuse after a sighting that could not be saved. It holds the time of
+// the refusal.
+export const REFUSAL_PREFIX = 'refusal:'
+// The most refusals that the store keeps, the newest (newestRefusals), and the most that a module instance holds of its
+// own. A module instance also holds every refusal that the store keeps.
+export const REFUSAL_LIMIT = 200
 const JOURNAL_LIMIT = 50
 // The most steps that a view follows up from a branch to the sessions that it started from.
 const LINEAGE_LIMIT = 10
@@ -162,6 +168,17 @@ export function keptBranches(branches: readonly SandboxTunerLineage[], named: Re
     .sort((a, b) => a.at - b.at || (a.session < b.session ? -1 : a.session > b.session ? 1 : 0))
   for (const branch of oldest.slice(0, kept.size - BRANCH_LIMIT)) kept.delete(branch.session)
   return kept
+}
+
+/**
+ * The sessions of the saved refusals (`saved`: each session and the time that its REFUSAL_PREFIX key holds), the newest
+ * first. A time that is not valid counts as the oldest. Equal times go by session id, as in keptBranches.
+ */
+export function newestRefusals(saved: ReadonlyMap<string, unknown>): string[] {
+  const timeOf = (value: unknown) => (isCount(value) ? value : -1)
+  return [...saved].map(([session, at]) => ({ session, at: timeOf(at) }))
+    .sort((a, b) => b.at - a.at || (a.session < b.session ? 1 : a.session > b.session ? -1 : 0))
+    .map(item => item.session)
 }
 
 /** Whether a session of the lineage saw a target: by a record that names it, or by the branch record of the step. */
