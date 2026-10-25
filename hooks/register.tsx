@@ -6,7 +6,7 @@ import type { EngineInterface, HookFailure, Register, RenderElement, Timer, Tool
 import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerLineage, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
 import { KeyFailure, causeOf, diagnostic, shownCause } from './diagnostics'
 import { TMP, absolutePath, commandLine, cutText, displayPath, isTempFolder, isUnder, pathFolders, plainText } from './names'
-import { JOURNAL_PREFIX, LINEAGE_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isLineage, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, keptBranches, keysSeenBy, lineageStep, mergeSighting, recordKey, seenIn, shownRecords } from './records'
+import { JOURNAL_PREFIX, LINEAGE_PREFIX, REFUSAL_LIMIT, REFUSAL_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isLineage, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, keptBranches, keysSeenBy, lineageStep, mergeSighting, newestRefusals, recordKey, seenIn, shownRecords } from './records'
 import type { Lineage } from './records'
 import { addEntry, fileInfo, isApplied, lockText, parseSettings, readLock, removeEntry, serializeSettings } from './settings-file'
 import type { FileInfo, ParsedSettings } from './settings-file'
@@ -16,7 +16,7 @@ import { anchorEntry, credentialEntries, denialEntries, denialVerdict, grantsMet
 import type { Change, Context, Sources, Verdict, Walk } from './verdicts'
 import { bandTree, buildBand, buildObservation, buildPane, canUndo, drawable, paneTree, reportText, summaryLine } from './views'
 import {
-  COMMAND_DESCRIPTION, NOTHING_TO_CHANGE, NOTHING_TO_UNDO, absentNotice, addedNotice, displayTarget, grantWarning, hiddenNotice, notAppliedText, notPlaced,
+  COMMAND_DESCRIPTION, NOTHING_TO_CHANGE, NOTHING_TO_UNDO, SWITCHING, absentNotice, addedNotice, displayTarget, grantWarning, hiddenNotice, notAppliedText, notPlaced,
   nothingApplied, hostText, refusalText, removedNotice, shownNotice, verdictSentences, verificationRefusalText,
 } from './words'
 
@@ -52,9 +52,197 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
 // $.session.id() still names the session before at /resume and /branch. One per module instance, as the queue.
 let starting: string | null = null
 
-/** The current session: the one that classic.SessionStart starts while its dispatch runs (starting), else $.session.id(). */
+// How often Sandbox Tuner reads the session id while a switch waits (pending), and for how long at most. A hook, a
+// press, or a timer of Sandbox Tuner that comes later settles the switch too.
+const SWITCH_POLL_MS = 500
+const SWITCH_POLL_LIMIT_MS = 5 * 60_000
+// The event that the diagnostics of a switch that Sandbox Tuner settles itself name (settleSwitch).
+const SWITCH_EVENT = 'session.switch'
+
+/**
+ * A /clear, /resume, or /branch that session.end began: its reason, and `ended`, the session that ended. It waits until
+ * classic.SessionStart takes it, or until Sandbox Tuner settles it once $.session.id() names another session
+ * (settleSwitch). `isIncomplete`: whether a sighting of the session that ended could not be saved, also when that could
+ * not be read. The settle needs the view options and whether a person is at the prompt. `poll` reads the session id.
+ */
+type Pending = { reason: 'clear' | 'resume'; ended: string; isIncomplete: boolean; scope: SandboxTunerScope; threshold: number; isInteractive: boolean; poll: Timer | null }
+// The switch that waits. One per module instance, as the queue.
+let pending: Pending | null = null
+/**
+ * The last switch that Sandbox Tuner settled itself, until the next session.end or classic.SessionStart: the session
+ * that it started, its reason, and the session that ended before it, with its band (`before`).
+ */
+let settled: { session: string; reason: 'clear' | 'resume'; before: Ended | null } | null = null
+// The most session ids that `known` keeps: the newest.
+const KNOWN_LIMIT = 200
+// The sessions that this process ran or started last, the newest last, at most KNOWN_LIMIT (remember). A /resume to
+// another session is a /resume to a session of this process (an in-app /resume), or to a session that is new to it: a
+// /branch, or a session of another process. A session that left `known` counts as new, which fails closed (settleSwitch).
+const known = new Set<string>()
+// The sessions in which Allow and Deny refuse, as after a sighting that could not be saved, that this module instance
+// took itself: the newest last, at most REFUSAL_LIMIT (remember). Claude Code resets $.state at a switch, so an in-app
+// /resume takes the refusal back from here (startSession), and a press checks it too (targetRecord): a press that
+// settles a switch reads the $.state of before. The store keeps each refusal as well (saveRefusal), so that a reload of
+// the mod and another process keep it (loadRefusals).
+const incomplete = new Set<string>()
+// The sessions whose refusal the store keeps, as the last load found them (loadRefusals), with the saves and removals
+// of this module instance since (saveRefusal). The bound of `incomplete` never drops one of them.
+const stored = new Set<string>()
+
+/** Whether this module instance holds the refusal of Allow and Deny in `session`: its own (incomplete) or the store's (stored). */
+function isHeld(session: string): boolean {
+  return incomplete.has(session) || stored.has(session)
+}
+
+/**
+ * Whether Allow and Deny refuse in `session`: this module instance holds its refusal (isHeld), or the store keeps it
+ * now, saved by another Claude Code process too. Rejects when the store cannot be read.
+ */
+async function isRefusedIn($: EngineInterface, session: string): Promise<boolean> {
+  return isHeld(session) || (await $.store.get(REFUSAL_PREFIX + session)) !== undefined
+}
+
+/** Adds `session` to `sessions` as the newest, then removes the oldest past `limit`. */
+function remember(sessions: Set<string>, session: string, limit: number): void {
+  sessions.delete(session)
+  sessions.add(session)
+  for (const oldest of sessions) {
+    if (sessions.size <= limit) break
+    sessions.delete(oldest)
+  }
+}
+
+/** The saved refusals (REFUSAL_PREFIX): each session and the time that its key holds. */
+async function savedRefusals($: EngineInterface): Promise<Map<string, unknown>> {
+  const saved = new Map<string, unknown>()
+  for (const key of await $.store.keys()) {
+    if (key.startsWith(REFUSAL_PREFIX)) saved.set(key.slice(REFUSAL_PREFIX.length), await $.store.get(key))
+  }
+  return saved
+}
+
+/**
+ * Takes every refusal that the store keeps (saveRefusal), also of another Claude Code process, into `stored`, in place
+ * of the ones that the last load found. Runs in the module queue, at session.start and at each switch. Rejects when the
+ * store cannot be read: then `stored` keeps what it held, and a press reads the refusal of its session from the store
+ * before it writes (targetRecord).
+ */
+async function loadRefusals($: EngineInterface): Promise<void> {
+  const saved = (await $.store.keys()).filter(key => key.startsWith(REFUSAL_PREFIX)).map(key => key.slice(REFUSAL_PREFIX.length))
+  stored.clear()
+  for (const session of saved) stored.add(session)
+}
+
+/**
+ * Saves the refusal of Allow and Deny in `session` in the store, with the time, so that a reload of the mod, and
+ * another Claude Code process that runs the session later, keep it (loadRefusals). Then it removes the oldest refusals
+ * past the REFUSAL_LIMIT newest from the store. Runs in the module queue. A problem goes to the debug log: the refusal
+ * still holds in this module instance (incomplete). It never rejects.
+ */
+async function saveRefusal($: EngineInterface, session: string, event: string): Promise<void> {
+  try {
+    await $.store.set(REFUSAL_PREFIX + session, await $.clock.now())
+    stored.add(session)
+    for (const oldest of newestRefusals(await savedRefusals($)).slice(REFUSAL_LIMIT)) {
+      await $.store.delete(REFUSAL_PREFIX + oldest)
+      stored.delete(oldest)
+    }
+  } catch (error) {
+    // At session.end, the session is no longer current, so no later end of it tries again: only an in-app /resume of
+    // it (startSession, settleSwitch).
+    const retry = event === 'session.end'
+      ? 'The session has ended, so a reload of Sandbox Tuner or another Claude Code process does not keep the refusal. Sandbox Tuner tries again at an in-app /resume of the session.'
+      : 'Sandbox Tuner tries again when the session ends.'
+    logDebug($, diagnostic(event, null, `could not save the refusal of Allow and Deny after a sighting that could not be saved: ${causeOf(error)}. Allow and Deny still refuse in this Claude Code process. ${retry}`))
+  }
+}
+// With scope session, the session that ended last, for a /branch that follows (forkOf). It lives outside $.state:
+// Claude Code resets $.state between session.end and classic.SessionStart. The next classic.SessionStart takes it.
+let ended: Ended | null = null
+
+/** The cause of a session id read while a switch is in progress: Claude Code still names the session that ended. */
+class SwitchFailure extends Error {
+  constructor() {
+    super('a switch to another session is in progress')
+  }
+}
+
+/**
+ * The current session: the one that classic.SessionStart starts while its dispatch runs (starting), else $.session.id().
+ * While a switch waits (pending) and $.session.id() still names the session that ended, there is no current session: it
+ * rejects with a SwitchFailure, so that no load, press, or call counts for the session that ended or the next one.
+ */
 async function sessionNow($: EngineInterface): Promise<string> {
-  return starting ?? (await $.session.id())
+  if (starting !== null) return starting
+  const session = await $.session.id()
+  if (pending !== null && session === pending.ended) throw new SwitchFailure()
+  return session
+}
+
+/** Ends the switch that waits, and its poll. */
+function endSwitch(): void {
+  pending?.poll?.cancel()
+  pending = null
+}
+
+/**
+ * Keeps the switch that session.end begins at /clear, /resume, or /branch (pending), and reads the session id every
+ * SWITCH_POLL_MS until Sandbox Tuner settles the switch or classic.SessionStart takes it, at most SWITCH_POLL_LIMIT_MS.
+ * A later session.end replaces it.
+ */
+function beginSwitch($: EngineInterface, next: Omit<Pending, 'poll'>): Pending {
+  endSwitch()
+  settled = null
+  const begun: Pending = { ...next, poll: null }
+  pending = begun
+  let polls = 0
+  begun.poll = $.clock.every(SWITCH_POLL_MS, () => {
+    polls += 1
+    if (pending !== begun || polls * SWITCH_POLL_MS > SWITCH_POLL_LIMIT_MS) begun.poll?.cancel()
+    else void settleSwitch($)
+  })
+  return begun
+}
+
+/**
+ * Settles the switch that waits (pending) once $.session.id() names another session than the one that ended. This is
+ * for sessions where classic.SessionStart does not reach Sandbox Tuner: with managed settings or a Team or Enterprise
+ * sign-in, Claude Code's built-in guard keeps every classic event from mods. In the queue, it does what classic.SessionStart
+ * does for /clear and /resume, then it runs the check of a session start. A /branch looks like a /resume of a session
+ * that is new to this process, so the new session inherits nothing. When the session that ended had a failed sighting
+ * save, such a session keeps the refusal of Allow and Deny, because it can be a branch of it. A session of this process
+ * takes its own refusal back. It runs at the start of each hook, press, and timer of Sandbox Tuner, outside the queue,
+ * and never in a ui.render hook, which cannot write state. Returns whether the switch is still in progress:
+ * $.session.id() still names the session that ended. It never rejects.
+ */
+async function settleSwitch($: EngineInterface): Promise<boolean> {
+  const found = pending
+  if (found === null) return false
+  let session: string
+  try {
+    session = await $.session.id()
+  } catch {
+    // The hook reads the session id again, and says why it fails.
+    return false
+  }
+  // Another hook settled the switch during the read, or classic.SessionStart took it.
+  if (pending !== found) return false
+  if (session === found.ended) return true
+  endSwitch()
+  settled = { session, reason: found.reason, before: ended }
+  ended = null
+  const isKnown = known.has(session)
+  remember(known, session, KNOWN_LIMIT)
+  // The settle in the queue reads the refusal of the session from the store too (startSession).
+  const isRefused = isHeld(session) || (found.reason === 'resume' && !isKnown && found.isIncomplete)
+  // At once: a press that settles the switch checks it in the queue after the settle (targetRecord).
+  if (isRefused) remember(incomplete, session, REFUSAL_LIMIT)
+  const { scope, threshold, isInteractive } = found
+  const check = () => {
+    if (isInteractive) void recheckOnce($, threshold, scope, true)
+  }
+  void enqueue(() => startSession($, scope, { session, event: SWITCH_EVENT, fork: null, isRefused, isSettled: false })).then(check, check)
+  return false
 }
 
 /** Runs the dispatch of classic.SessionStart with `session`, the session that it starts, as the current one (sessionNow). */
@@ -140,15 +328,21 @@ function toOutcome(out: ToolCallResult<'Bash'>): BashOutcome {
   return { isDenied: false, isError: false, isReadOnly: out.isReadOnly === true, backgroundTaskId: out.result.backgroundTaskId, isUnsandboxed: out.result.dangerouslyDisableSandbox, text: out.text ?? '', stderr: out.result.stderr }
 }
 
-/** The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it. */
-type Origin = { session: string } | { session: null; cause: string }
+/**
+ * The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it, and
+ * whether a switch was in progress then (`isSwitching`, SwitchFailure).
+ */
+type Origin = { session: string } | { session: null; cause: string; isSwitching: boolean }
+
+// The session of a press that starts while a switch is in progress (runPress).
+const SWITCH_ORIGIN: Origin = { session: null, cause: causeOf(new SwitchFailure()), isSwitching: true }
 
 /** Reads the session of a press or a tool call when it starts, before it waits for the call or the module queue. */
 async function sessionOrigin($: EngineInterface): Promise<Origin> {
   try {
     return { session: await sessionNow($) }
   } catch (error) {
-    return { session: null, cause: causeOf(error) }
+    return { session: null, cause: causeOf(error), isSwitching: error instanceof SwitchFailure }
   }
 }
 
@@ -189,8 +383,11 @@ async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | nu
   return null
 }
 
-/** Saves one sighting. It adds the target to the targets that the pane shows only for a call of this session (`isShown`). */
-async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighting: Sighting, sessionId: string | null, now: number, tool: string, isShown: boolean): Promise<void> {
+/**
+ * Saves one sighting. It adds the target to the targets that the pane shows only for a call of this session (`isShown`).
+ * Returns whether the sighting is saved.
+ */
+async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighting: Sighting, sessionId: string | null, now: number, tool: string, isShown: boolean): Promise<boolean> {
   const key = recordKey(sighting)
   try {
     const storeKey = `${WRITER_PREFIX}${writerId}:${key}`
@@ -202,10 +399,14 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
     // With scope session, a sighting with no session id names no session: it adds no target, and a load would not show it.
     const isListed = (list: readonly SandboxTunerRecord[]) => scope === 'all' || sessionId !== null || list.some(record => record.key === key)
     if (isShown) await update($, records, list => (isListed(list) ? [...list.filter(record => record.key !== key), refreshed] : list))
+    return true
   } catch (error) {
+    // The session that ran the call refuses, also after an in-app /resume of it (startSession) and a reload (recordCall).
+    if (sessionId !== null) remember(incomplete, sessionId, REFUSAL_LIMIT)
     await update($, evidenceIncomplete, () => true)
     const problem = (cause: string) => diagnostic('tool.call', tool, `could not save the sighting of ${key}: ${cause}`)
     await noteCallFault($, isShown, problem(causeOf(error)), problem(shownCause(scope, error)))
+    return false
   }
 }
 
@@ -243,10 +444,14 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: C
   const sessionId = await sessionIdOf($, tool, origin, isShown)
   const now = await $.clock.now()
   await keepBranchKeys($, sessionId, now)
+  let isLost = false
   for (const sighting of sightings) {
-    if (signal.aborted) return
-    await saveSighting($, scope, sighting, sessionId, now, tool, isShown)
+    if (signal.aborted) break
+    if (!(await saveSighting($, scope, sighting, sessionId, now, tool, isShown))) isLost = true
   }
+  // Once for the call: the store that could not save a sighting can refuse this write too.
+  if (isLost && sessionId !== null) await saveRefusal($, sessionId, 'tool.call')
+  if (signal.aborted) return
   const newest = latestOf(sightings, commandLine(call.command), now)
   if (newest !== null && isShown) await update($, latest, () => newest)
 }
@@ -319,11 +524,14 @@ async function currentLineage($: EngineInterface, event: string, detail: string 
 }
 
 /**
- * Keeps the refusal of Allow and Deny in the branch `session`, whose parent could not save a sighting. While $.state
- * refuses it, the branch stays in `unrestored`: Allow and Deny refuse, and a load shows no target that the branch
- * inherited (targetLineage). Returns why it could not keep the refusal, or null.
+ * Keeps the refusal of Allow and Deny in `session`: a branch whose parent could not save a sighting, a session of this
+ * process that could not, or after a switch that Sandbox Tuner settled, a session that can be a branch of one
+ * (settleSwitch). While $.state refuses it, the session stays in `unrestored`: Allow and Deny refuse, and a load shows
+ * no target that a branch inherited (targetLineage). The store keeps the refusal too (saveRefusal). Returns why $.state
+ * could not keep the refusal, or null.
  */
-async function keepRefusal($: EngineInterface, session: string): Promise<string | null> {
+async function keepRefusal($: EngineInterface, session: string, event: string): Promise<string | null> {
+  remember(incomplete, session, REFUSAL_LIMIT)
   try {
     await update($, evidenceIncomplete, () => true)
     unrestored.delete(session)
@@ -331,6 +539,8 @@ async function keepRefusal($: EngineInterface, session: string): Promise<string 
   } catch (error) {
     unrestored.add(session)
     return causeOf(error)
+  } finally {
+    await saveRefusal($, session, event)
   }
 }
 
@@ -342,7 +552,7 @@ async function keepRefusal($: EngineInterface, session: string): Promise<string 
 async function targetLineage($: EngineInterface, event: string, detail: string | null, lineage: readonly Lineage[]): Promise<readonly Lineage[]> {
   const [own] = lineage
   if (own === undefined || !lineage.some(item => unrestored.has(item.session))) return lineage
-  const cause = await keepRefusal($, own.session)
+  const cause = await keepRefusal($, own.session, event)
   if (cause === null) return lineage
   logDebug($, diagnostic(event, detail, `could not keep the refusal after a sighting that the session before could not save, so the branch shows no target of it: ${cause}`))
   return [own]
@@ -1084,7 +1294,7 @@ async function recheckPlan($: EngineInterface, buttonKey: string, first: Planned
     return 'id' in entry ? first : entry
   }
   const { edit } = first
-  const record = await targetRecord($, edit.record.key, buttonKey)
+  const record = await targetRecord($, edit.record.key, buttonKey, edit.session ?? null)
   if (!('key' in record)) return record
   if (JSON.stringify(record) === JSON.stringify(edit.record)) return first
   const verdict = verdictOf(record, edit.context)
@@ -1162,9 +1372,16 @@ async function editSettings($: EngineInterface, buttonKey: string, file: FileInf
   }
 }
 
-/** The saved record of a target, read again from every writer, or the result of a press that stops. */
-async function targetRecord($: EngineInterface, key: string, buttonKey: string): Promise<SandboxTunerRecord | PressResult> {
-  if ((await read($, evidenceIncomplete)) || (await isUnrestored($, buttonKey))) return failure(buttonKey, 'some sightings could not be saved. Durable safety evidence is incomplete. Nothing was written.')
+/**
+ * The saved record of a target, read again from every writer, or the result of a press that stops. It stops when a
+ * sighting could not be saved: in the session of the press (`session`, null when unknown) by the refusal that this
+ * module instance holds or that the store keeps now (isRefusedIn), or by $.state. It stops too when the store cannot
+ * say. A press that settled a switch reads the $.state of before the switch, so the refusal that the switch took back
+ * is not there.
+ */
+async function targetRecord($: EngineInterface, key: string, buttonKey: string, session: string | null): Promise<SandboxTunerRecord | PressResult> {
+  const isRefused = (session !== null && (await isRefusedIn($, session))) || (await read($, evidenceIncomplete)) || (await isUnrestored($, buttonKey))
+  if (isRefused) return failure(buttonKey, 'some sightings could not be saved. Durable safety evidence is incomplete. Nothing was written.')
   return (await readRecords($, key))[0] ?? info(NOTHING_TO_CHANGE)
 }
 
@@ -1212,7 +1429,7 @@ async function applyFix($: EngineInterface, threshold: number, scope: SandboxTun
   } catch (error) {
     return failure(buttonKey, `could not check the current settings: ${causeOf(error)}. Nothing was written.`)
   }
-  const record = await targetRecord($, key, buttonKey)
+  const record = await targetRecord($, key, buttonKey, origin.session)
   if (!('key' in record)) return record
   if (context.file === undefined) return info(nothingApplied(verdictSentences(record, verdictOf(record, context), context)))
   const unlabeled = await unlabeledGuess($, buttonKey, { action, isLabeled }, record, verdictOf(record, context))
@@ -1247,23 +1464,21 @@ type Band = { latest: SandboxTunerLatest | null; dismissed: string | null }
 type Ended = { session: string; band: Band | null; isIncomplete: boolean }
 /**
  * A /branch with scope session: the branch (`session`, the id of its classic.SessionStart), the session that it
- * started from (null when unknown), the time of the branch, the band of that session, and whether a sighting of that
- * session could not be saved.
+ * started from (null when unknown), the time of the branch, and the band of that session.
  */
-type Fork = { session: string; parent: string | null; at: number; band: Band | null; isIncomplete: boolean }
+type Fork = { session: string; parent: string | null; at: number; band: Band | null }
 
 /**
  * The /branch that classic.SessionStart with source fork starts. Its parent is the session whose session.end came
- * right before (`ended`). With no such session.end, it is the session that $.session.id() names: during this hook, it
+ * right before (`before`). With no such session.end, it is the session that $.session.id() names: during this hook, it
  * still names the session before the branch. Its record waits in the module queue from the time of the branch (waiting).
  */
-async function forkOf($: EngineInterface, session: string, ended: Ended | null): Promise<Fork> {
-  const parent = ended?.session ?? (await $.session.id().catch(() => null))
+async function forkOf($: EngineInterface, session: string, before: Ended | null): Promise<Fork> {
+  const parent = before?.session ?? (await $.session.id().catch(() => null))
   const at = await $.clock.now()
-  const isIncomplete = ended?.isIncomplete ?? false
-  if (parent === session) return { session, parent: null, at, band: null, isIncomplete }
+  if (parent === session) return { session, parent: null, at, band: null }
   if (parent !== null) waiting.set(session, { parent, at, seen: null })
-  return { session, parent, at, band: ended?.band ?? null, isIncomplete }
+  return { session, parent, at, band: before?.band ?? null }
 }
 
 /**
@@ -1315,14 +1530,25 @@ async function pruneBranches($: EngineInterface, current: string, found: readonl
 }
 
 /**
+ * What a session that /clear, /resume, or /branch started in this process takes over: its id, the event that the
+ * diagnostics name, the /branch (`fork`) with scope session, whether Allow and Deny keep refusing in it (`isRefused`),
+ * and whether Sandbox Tuner settled the switch to it already (`isSettled`, settleSwitch), so that what it shows since
+ * stays.
+ */
+type Start = { session: string; event: string; fork: Fork | null; isRefused: boolean; isSettled: boolean }
+
+/**
  * Loads the saved targets for the session that /clear, /resume, or /branch started in this process (sessionNow). With
  * scope session, nothing of the session before stays first: not its targets, so that a load that fails shows none, its
  * band, its notice, its dismissal, its last background problem, which can name its targets, or the place in its Applied
- * list. A /branch (`fork`) then saves its lineage record, takes the band, the dismissal, and a failed sighting save of
- * its parent back, and loads the view of the branch: what it inherits, and later what it adds.
+ * list. A session that refuses (`isRefused`), or whose refusal this module instance holds (isHeld) or the store keeps
+ * now (isRefusedIn), keeps the refusal of Allow and Deny. When the store cannot be read, the debug log says why, and a
+ * press reads it again before it writes. A /branch (`fork`) then saves its lineage record, takes the band and the
+ * dismissal of its parent back, and loads the view of the branch: what it inherits, and later what it adds.
  */
-async function startSession($: EngineInterface, scope: SandboxTunerScope, fork: Fork | null): Promise<void> {
-  if (scope === 'session') {
+async function startSession($: EngineInterface, scope: SandboxTunerScope, start: Start): Promise<void> {
+  const { event, fork } = start
+  if (scope === 'session' && !start.isSettled) {
     const clears: (() => Promise<unknown>)[] = [
       () => update($, records, () => []),
       () => update($, latest, () => null),
@@ -1334,28 +1560,39 @@ async function startSession($: EngineInterface, scope: SandboxTunerScope, fork: 
     // Each clear that fails leaves the others to run.
     const problems: string[] = []
     for (const clear of clears) await clear().catch((error: unknown) => problems.push(causeOf(error)))
-    if (problems.length > 0) await noteFault($, diagnostic('classic.SessionStart', null, `could not clear what the session before showed: ${problems.join('; ')}`))
+    if (problems.length > 0) await noteFault($, diagnostic(event, null, `could not clear what the session before showed: ${problems.join('; ')}`))
+  }
+  // The refusals that another Claude Code process saved since the last load, such as of a session that it ran.
+  await loadRefusals($).catch((error: unknown) => logDebug($, diagnostic(event, null, `could not load the sessions in which Allow and Deny refuse: ${causeOf(error)}. A press reads the refusal of its session before it writes.`)))
+  const isRefused = start.isRefused || (await isRefusedIn($, start.session).catch((error: unknown) => {
+    logDebug($, diagnostic(event, null, `could not read whether Allow and Deny refuse in the session: ${causeOf(error)}. A press reads it again before it writes.`))
+    return false
+  }))
+  if (isRefused) {
+    // A branch shows the targets of its parent: Allow and Deny refuse there too.
+    const cause = await keepRefusal($, start.session, event)
+    if (cause !== null) {
+      await noteFault($, fork === null
+        ? diagnostic(event, null, `could not keep the refusal of Allow and Deny after a sighting that could not be saved: ${cause}. Allow and Deny still refuse.`)
+        : diagnostic(event, 'fork', `could not keep the refusal after a sighting that the session before could not save: ${cause}. Allow and Deny refuse, and the branch shows no target of the session before until a later load, such as /sandbox-tuner, keeps the refusal.`))
+    }
   }
   if (fork === null) {
-    await loadSaved($, scope, 'classic.SessionStart', null)
+    await loadSaved($, scope, event, null)
     return
-  }
-  if (fork.isIncomplete) {
-    // The branch shows the targets of its parent: Allow and Deny refuse there too.
-    const cause = await keepRefusal($, fork.session)
-    if (cause !== null) await noteFault($, diagnostic('classic.SessionStart', 'fork', `could not keep the refusal after a sighting that the session before could not save: ${cause}. Allow and Deny refuse, and the branch shows no target of the session before until a later load, such as /sandbox-tuner, keeps the refusal.`))
   }
   await saveLineage($, scope, fork)
   const { band } = fork
   if (band !== null) {
     try {
-      await update($, latest, () => band.latest)
-      await update($, dismissed, () => band.dismissed)
+      // After a switch that Sandbox Tuner settled, the band of a later block and its dismissal stay.
+      await update($, latest, last => (start.isSettled && last !== null ? last : band.latest))
+      await update($, dismissed, last => (start.isSettled && last !== null ? last : band.dismissed))
     } catch (error) {
-      await noteFault($, diagnostic('classic.SessionStart', 'fork', `could not show the band of the session that /branch started from: ${causeOf(error)}`))
+      await noteFault($, diagnostic(event, 'fork', `could not show the band of the session that /branch started from: ${causeOf(error)}`))
     }
   }
-  await loadSaved($, scope, 'classic.SessionStart', null)
+  await loadSaved($, scope, event, null)
 }
 
 /**
@@ -1426,12 +1663,16 @@ async function confirmChange($: EngineInterface, scope: SandboxTunerScope, butto
 
 /**
  * Runs one press in the module queue, with the session of the press (sessionOrigin), and shows its result: with scope
- * session, it runs and shows only in that session (pressStop, isSessionNow). It never rejects: a Button drops what
- * onPress returns.
+ * session, it runs and shows only in that session (pressStop, isSessionNow). A press that starts while a switch is in
+ * progress (settleSwitch) has no session, also when Claude Code names the new session right after. Then an Allow or a
+ * Deny (`isFix`) refuses with either scope, also when the switch settles while the press waits in the queue: with no
+ * session, it cannot check the refusal of the session that ended or of the next one (targetRecord). The next press
+ * reads the new session. It never rejects: a Button drops what onPress returns.
  */
-async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>): Promise<void> {
-  const origin = await sessionOrigin($)
+async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>, isFix = false): Promise<void> {
+  const origin = (await settleSwitch($)) ? SWITCH_ORIGIN : await sessionOrigin($)
   const result = await enqueue(async () => {
+    if (isFix && origin.session === null && origin.isSwitching) return failure(buttonKey, `${SWITCHING} Nothing was written.`)
     const stop = await pressStop($, scope, origin)
     if (stop !== null) {
       logDebug($, diagnostic('ui.press', buttonKey, stop))
@@ -1459,6 +1700,11 @@ async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey:
   } catch (error) {
     logDebug($, diagnostic('ui.press', buttonKey, `could not show the notice "${result.text}": ${causeOf(error)}`))
   }
+}
+
+/** Runs a press of Allow or Deny (applyFix), which refuses while a switch is in progress (runPress). */
+function runFix($: EngineInterface, threshold: number, scope: SandboxTunerScope, key: string, action: SandboxTunerAction, buttonKey: string, isLabeled = false): Promise<void> {
+  return runPress($, scope, buttonKey, origin => applyFix($, threshold, scope, key, action, buttonKey, origin, isLabeled), true)
 }
 
 async function readJournal($: EngineInterface): Promise<SandboxTunerApplied[]> {
@@ -1525,11 +1771,16 @@ async function undoFix($: EngineInterface, scope: SandboxTunerScope, id: string,
 
 /**
  * The rows of the Applied list: with scope session, only the edits that a press of the lineage of the current session
- * saved by its time.
+ * saved by its time. None while a switch is in progress: no session is current then (sessionNow).
  */
 async function shownJournal($: EngineInterface, scope: SandboxTunerScope, event: string): Promise<SandboxTunerApplied[]> {
   const journal = await read($, applied)
-  return scope === 'all' ? journal : appliedIn(journal, await currentLineage($, event, null))
+  if (scope === 'all') return journal
+  const lineage = await currentLineage($, event, null).catch((error: unknown) => {
+    if (error instanceof SwitchFailure) return null
+    throw error
+  })
+  return lineage === null ? [] : appliedIn(journal, lineage)
 }
 
 async function moveApplied($: EngineInterface, scope: SandboxTunerScope, delta: number): Promise<null> {
@@ -1562,9 +1813,6 @@ export const register: Register = (on, options) => {
   let isInteractive = false
   // The timer of the timed check: one for the process, across /clear. A hot reload cancels it with the old module.
   let linkTimer: Timer | null = null
-  // With scope session, the session that ended last, for a /branch that follows (forkOf). It lives outside $.state:
-  // Claude Code resets $.state between session.end and classic.SessionStart. The next classic.SessionStart takes it.
-  let ended: Ended | null = null
   // A hot reload runs session.start again: it registers the command again and loads the store again.
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -1574,11 +1822,17 @@ export const register: Register = (on, options) => {
     } catch (error) {
       await noteFault($, diagnostic('session.start', null, `could not register /sandbox-tuner: ${causeOf(error)}`))
     }
+    // A reload of the mod starts `incomplete` and `stored` empty: the store keeps the refusals of the sessions before.
+    // First in the queue, so that a press waits for it.
+    void enqueue(() => loadRefusals($).catch((error: unknown) => logDebug($, diagnostic('session.start', null, `could not load the sessions in which Allow and Deny refuse: ${causeOf(error)}. A press reads the refusal of its session before it writes.`))))
     void enqueue(() => loadSaved($, scope, 'session.start', null))
     // Outside the queue: its walk must not hold back the recording of the first Bash calls.
     if (e.isInteractive) void recheckOnce($, threshold, scope, true)
-    // A link made during the session: the check at its start cannot see it.
-    if (e.isInteractive && linkTimer === null && linkCheckMs > 0) linkTimer = $.clock.every(linkCheckMs, () => void recheckOnce($, threshold, scope, false))
+    // A link made during the session: the check at its start cannot see it. While a switch is in progress, no session is
+    // current, and the check of the start of the next session comes once it settles.
+    if (e.isInteractive && linkTimer === null && linkCheckMs > 0) {
+      linkTimer = $.clock.every(linkCheckMs, () => void settleSwitch($).then(isSwitching => (isSwitching ? undefined : recheckOnce($, threshold, scope, false))))
+    }
     return started
   }).catch(($, e, next) => {
     hookFailed($, 'session.start', null, next.error)
@@ -1586,16 +1840,29 @@ export const register: Register = (on, options) => {
   })
 
   // /clear, /resume, and /branch end the session first, while $.state still holds its values. The snapshot waits for no
-  // queue: the end has a short time bound.
+  // queue: the end has a short time bound. The switch waits for classic.SessionStart, or for the session id of the new
+  // session where classic.SessionStart does not reach Sandbox Tuner (beginSwitch, settleSwitch).
   on('session.end', async ($, e, next) => {
+    const session = e.sessionId
+    remember(known, session, KNOWN_LIMIT)
+    // A band that cannot be read stays behind, and the branch still gets its lineage record. A flag that cannot be read
+    // counts as a failed sighting save, so that Allow and Deny refuse in the branch and after an in-app /resume of the
+    // session, and so does a refusal that the session could not keep (unrestored).
+    ended = { session, band: null, isIncomplete: true }
+    const switching = e.reason === 'clear' || e.reason === 'resume' ? beginSwitch($, { reason: e.reason, ended: session, isIncomplete: true, scope, threshold, isInteractive }) : null
+    const wasIncomplete = unrestored.has(session) || isHeld(session)
+    // Until the flag is read: the bound applies once the refusal stays.
+    incomplete.add(session)
+    const isIncomplete = wasIncomplete || (await read($, evidenceIncomplete))
+    if (!isIncomplete) incomplete.delete(session)
+    else {
+      remember(incomplete, session, REFUSAL_LIMIT)
+      // Now the session is not current: a reload of the mod or another process keeps its refusal only from the store.
+      void enqueue(() => saveRefusal($, session, 'session.end'))
+    }
+    if (switching !== null) switching.isIncomplete = isIncomplete
+    ended = { session, band: null, isIncomplete }
     if (scope === 'session') {
-      const session = e.sessionId
-      // A band that cannot be read stays behind, and the branch still gets its lineage record. A flag that cannot be
-      // read counts as a failed sighting save, so that Allow and Deny refuse in the branch, and so does a refusal that
-      // the session could not keep (unrestored).
-      ended = { session, band: null, isIncomplete: true }
-      const isIncomplete = unrestored.has(session) || (await read($, evidenceIncomplete))
-      ended = { session, band: null, isIncomplete }
       const band: Band = { latest: await read($, latest), dismissed: await read($, dismissed) }
       ended = { session, band, isIncomplete }
     }
@@ -1608,23 +1875,33 @@ export const register: Register = (on, options) => {
   // /clear, /resume, and /branch start a new session in the same process, and session.start does not fire. During this
   // hook and the settings SessionStart hooks beneath it (next), $.session.id() still names the session before at
   // /branch and /resume. With scope session, the whole dispatch takes the id of the event as the current session, so
-  // that a press or a call in it counts for the session that the band and the pane show (whileStarting).
+  // that a press or a call in it counts for the session that the band and the pane show (whileStarting). This hook takes
+  // the switch that waits (pending). When Sandbox Tuner settled the same /clear or /resume already, nothing changes.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    const before = ended
+    const session = e.session_id
+    const early = settled !== null && settled.session === session ? settled : null
+    const before = ended ?? early?.before ?? null
     ended = null
+    settled = null
+    endSwitch()
+    remember(known, session, KNOWN_LIMIT)
     const dispatch = async () => {
-      const fork = scope === 'session' && e.source === 'fork' ? await forkOf($, e.session_id, before) : null
-      await enqueue(() => startSession($, scope, fork))
+      if (early !== null && early.reason === e.source) return next(e)
+      const fork = scope === 'session' && e.source === 'fork' ? await forkOf($, session, before) : null
+      // The session takes its own refusal back, and a branch the refusal of its parent.
+      const isRefused = isHeld(session) || (e.source === 'fork' && (before?.isIncomplete ?? false))
+      await enqueue(() => startSession($, scope, { session, event: 'classic.SessionStart', fork, isRefused, isSettled: early !== null }))
       if (isInteractive) void recheckOnce($, threshold, scope, true)
       return next(e)
     }
-    return scope === 'session' ? whileStarting(e.session_id, dispatch) : dispatch()
+    return scope === 'session' ? whileStarting(session, dispatch) : dispatch()
   }).catch(($, e, next) => {
     hookFailed($, 'classic.SessionStart', null, next.error)
     return next(e)
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    await settleSwitch($)
     // With scope session, the session and the working directory of the call, read before it runs: /clear, /resume, or
     // /branch can start another session while it runs.
     const start = scope === 'session' ? await callStart($) : null
@@ -1638,6 +1915,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
+    await settleSwitch($)
     const start = scope === 'session' ? await callStart($) : null
     const out = await next(e)
     if (!next.signal.aborted && e.command !== undefined && e.ws === undefined && out.deny === undefined && out.isError !== true && out.result.taskId !== '') {
@@ -1667,8 +1945,8 @@ export const register: Register = (on, options) => {
     const model = buildBand(last, record, verdictOf(record, context), context, await noticeNow($, scope))
     const beneath: RenderElement = await next(e)
     return bandTree($.ui.resolve(e), model, {
-      allow: () => void runPress($, scope, 'band-allow', origin => applyFix($, threshold, scope, record.key, 'allow', 'band-allow', origin, model.guessed !== null)),
-      deny: () => void runPress($, scope, 'band-deny', origin => applyFix($, threshold, scope, record.key, 'deny', 'band-deny', origin)),
+      allow: () => void runFix($, threshold, scope, record.key, 'allow', 'band-allow', model.guessed !== null),
+      deny: () => void runFix($, threshold, scope, record.key, 'deny', 'band-deny'),
       open: () => void runPress($, scope, 'band-open', () => openPress($, scope)),
       dismiss: () => void runPress($, scope, 'band-dismiss', () => dismissPress($, record.key)),
     }, beneath, e.props.bodyColumns)
@@ -1695,8 +1973,8 @@ export const register: Register = (on, options) => {
       scope,
     })
     return paneTree($.ui.resolve(e), model, {
-      allow: (key, isLabeled) => void runPress($, scope, `allow:${key}`, origin => applyFix($, threshold, scope, key, 'allow', `allow:${key}`, origin, isLabeled)),
-      deny: key => void runPress($, scope, `deny:${key}`, origin => applyFix($, threshold, scope, key, 'deny', `deny:${key}`, origin)),
+      allow: (key, isLabeled) => void runFix($, threshold, scope, key, 'allow', `allow:${key}`, isLabeled),
+      deny: key => void runFix($, threshold, scope, key, 'deny', `deny:${key}`),
       hide: key => void runPress($, scope, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
       unhide: key => void runPress($, scope, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),
       undo: id => void runPress($, scope, `undo:${id}`, origin => undoFix($, scope, id, `undo:${id}`, origin)),
@@ -1709,6 +1987,8 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'sandbox-tuner' }, async $ => {
+    // While Claude Code still names the session that ended, no session is current: load nothing, and say so.
+    if (await settleSwitch($)) return { text: hostText(plainText(SWITCHING)) }
     const loaded = await enqueue(() => loadSaved($, scope, 'command.run', '/sandbox-tuner'))
     const prefix = typeof loaded === 'string' ? `${loaded}\n\n` : ''
     const context = await loadContext($, threshold, 'command.run (/sandbox-tuner)')

@@ -22,6 +22,8 @@ export const NOTHING_TO_UNDO = 'Nothing to undo.'
 export const NOTHING_TO_CHANGE = 'Nothing to change: the target is no longer listed.'
 export const APPLY_HINT = 'To apply a fix, run /sandbox-tuner in an interactive session and press Allow or Deny.'
 export const COMMAND_DESCRIPTION = 'Review the hosts and write folders the sandbox keeps blocking.'
+// What /sandbox-tuner prints while Claude Code still names the session that /clear, /resume, or /branch ended.
+export const SWITCHING = 'A switch to another session is in progress, so Sandbox Tuner shows no target yet. Run /sandbox-tuner again in a moment.'
 // The keyboard path to the band Buttons, drawn dim after them: Claude Code's focus chord, then Tab, Enter, or Esc.
 export const BAND_KEY_HINT = 'ctrl+x tab to choose'
 // The label next to an Allow whose target has blocks that Sandbox Tuner guessed from error text.
