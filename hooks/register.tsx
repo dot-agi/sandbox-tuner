@@ -148,7 +148,12 @@ async function saveRefusal($: EngineInterface, session: string, event: string): 
       stored.delete(oldest)
     }
   } catch (error) {
-    logDebug($, diagnostic(event, null, `could not save the refusal of Allow and Deny after a sighting that could not be saved: ${causeOf(error)}. Allow and Deny still refuse in this Claude Code process. Sandbox Tuner tries again when the session ends.`))
+    // At session.end, the session is no longer current, so no later end of it tries again: only an in-app /resume of
+    // it (startSession, settleSwitch).
+    const retry = event === 'session.end'
+      ? 'The session has ended, so a reload of Sandbox Tuner or another Claude Code process does not keep the refusal. Sandbox Tuner tries again at an in-app /resume of the session.'
+      : 'Sandbox Tuner tries again when the session ends.'
+    logDebug($, diagnostic(event, null, `could not save the refusal of Allow and Deny after a sighting that could not be saved: ${causeOf(error)}. Allow and Deny still refuse in this Claude Code process. ${retry}`))
   }
 }
 // With scope session, the session that ended last, for a /branch that follows (forkOf). It lives outside $.state:
@@ -323,15 +328,21 @@ function toOutcome(out: ToolCallResult<'Bash'>): BashOutcome {
   return { isDenied: false, isError: false, isReadOnly: out.isReadOnly === true, backgroundTaskId: out.result.backgroundTaskId, isUnsandboxed: out.result.dangerouslyDisableSandbox, text: out.text ?? '', stderr: out.result.stderr }
 }
 
-/** The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it. */
-type Origin = { session: string } | { session: null; cause: string }
+/**
+ * The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it, and
+ * whether a switch was in progress then (`isSwitching`, SwitchFailure).
+ */
+type Origin = { session: string } | { session: null; cause: string; isSwitching: boolean }
+
+// The session of a press that starts while a switch is in progress (runPress).
+const SWITCH_ORIGIN: Origin = { session: null, cause: causeOf(new SwitchFailure()), isSwitching: true }
 
 /** Reads the session of a press or a tool call when it starts, before it waits for the call or the module queue. */
 async function sessionOrigin($: EngineInterface): Promise<Origin> {
   try {
     return { session: await sessionNow($) }
   } catch (error) {
-    return { session: null, cause: causeOf(error) }
+    return { session: null, cause: causeOf(error), isSwitching: error instanceof SwitchFailure }
   }
 }
 
@@ -1652,13 +1663,16 @@ async function confirmChange($: EngineInterface, scope: SandboxTunerScope, butto
 
 /**
  * Runs one press in the module queue, with the session of the press (sessionOrigin), and shows its result: with scope
- * session, it runs and shows only in that session (pressStop, isSessionNow). It never rejects: a Button drops what
- * onPress returns.
+ * session, it runs and shows only in that session (pressStop, isSessionNow). A press that starts while a switch is in
+ * progress (settleSwitch) has no session, also when Claude Code names the new session right after. Then an Allow or a
+ * Deny (`isFix`) refuses with either scope, also when the switch settles while the press waits in the queue: with no
+ * session, it cannot check the refusal of the session that ended or of the next one (targetRecord). The next press
+ * reads the new session. It never rejects: a Button drops what onPress returns.
  */
-async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>): Promise<void> {
-  await settleSwitch($)
-  const origin = await sessionOrigin($)
+async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey: string, action: (origin: Origin) => Promise<PressResult | null>, isFix = false): Promise<void> {
+  const origin = (await settleSwitch($)) ? SWITCH_ORIGIN : await sessionOrigin($)
   const result = await enqueue(async () => {
+    if (isFix && origin.session === null && origin.isSwitching) return failure(buttonKey, `${SWITCHING} Nothing was written.`)
     const stop = await pressStop($, scope, origin)
     if (stop !== null) {
       logDebug($, diagnostic('ui.press', buttonKey, stop))
@@ -1686,6 +1700,11 @@ async function runPress($: EngineInterface, scope: SandboxTunerScope, buttonKey:
   } catch (error) {
     logDebug($, diagnostic('ui.press', buttonKey, `could not show the notice "${result.text}": ${causeOf(error)}`))
   }
+}
+
+/** Runs a press of Allow or Deny (applyFix), which refuses while a switch is in progress (runPress). */
+function runFix($: EngineInterface, threshold: number, scope: SandboxTunerScope, key: string, action: SandboxTunerAction, buttonKey: string, isLabeled = false): Promise<void> {
+  return runPress($, scope, buttonKey, origin => applyFix($, threshold, scope, key, action, buttonKey, origin, isLabeled), true)
 }
 
 async function readJournal($: EngineInterface): Promise<SandboxTunerApplied[]> {
@@ -1926,8 +1945,8 @@ export const register: Register = (on, options) => {
     const model = buildBand(last, record, verdictOf(record, context), context, await noticeNow($, scope))
     const beneath: RenderElement = await next(e)
     return bandTree($.ui.resolve(e), model, {
-      allow: () => void runPress($, scope, 'band-allow', origin => applyFix($, threshold, scope, record.key, 'allow', 'band-allow', origin, model.guessed !== null)),
-      deny: () => void runPress($, scope, 'band-deny', origin => applyFix($, threshold, scope, record.key, 'deny', 'band-deny', origin)),
+      allow: () => void runFix($, threshold, scope, record.key, 'allow', 'band-allow', model.guessed !== null),
+      deny: () => void runFix($, threshold, scope, record.key, 'deny', 'band-deny'),
       open: () => void runPress($, scope, 'band-open', () => openPress($, scope)),
       dismiss: () => void runPress($, scope, 'band-dismiss', () => dismissPress($, record.key)),
     }, beneath, e.props.bodyColumns)
@@ -1954,8 +1973,8 @@ export const register: Register = (on, options) => {
       scope,
     })
     return paneTree($.ui.resolve(e), model, {
-      allow: (key, isLabeled) => void runPress($, scope, `allow:${key}`, origin => applyFix($, threshold, scope, key, 'allow', `allow:${key}`, origin, isLabeled)),
-      deny: key => void runPress($, scope, `deny:${key}`, origin => applyFix($, threshold, scope, key, 'deny', `deny:${key}`, origin)),
+      allow: (key, isLabeled) => void runFix($, threshold, scope, key, 'allow', `allow:${key}`, isLabeled),
+      deny: key => void runFix($, threshold, scope, key, 'deny', `deny:${key}`),
       hide: key => void runPress($, scope, `hide:${key}`, () => setHidden($, key, true, `hide:${key}`)),
       unhide: key => void runPress($, scope, `unhide:${key}`, () => setHidden($, key, false, `unhide:${key}`)),
       undo: id => void runPress($, scope, `undo:${id}`, origin => undoFix($, scope, id, `undo:${id}`, origin)),
