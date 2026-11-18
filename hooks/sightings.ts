@@ -1,7 +1,7 @@
 // Reads one Bash call into sightings.
 
 import type { SandboxTunerKind, SandboxTunerLatest } from '../types'
-import { absolutePath, cacheFolder, folderTarget, isGuardedPath, plainText, programName, splitHost } from './names'
+import { absolutePath, cacheFolder, folderTarget, isGuardedPath, isReadOnlyCommand, isReadOnlyLine, plainText, programName, splitHost } from './names'
 import { recordKey } from './records'
 
 type Counter = 'blocked' | 'listed' | 'inferred'
@@ -21,7 +21,7 @@ export type GatedSighting = { gate: Gate; sighting: Sighting }
 type CallSightings = { reports: Sighting[]; gated: GatedSighting[]; unknownLine: string | null; observation?: { operation: string; detail: string }; skipped?: true }
 export type SandboxFacts = { isEnabled: boolean; allowsUnsandboxed: boolean }
 export type BashCall = { command: string; isBackground: boolean; isUnsandboxed: boolean; allowedDomains: readonly string[] }
-export type BashOutcome = { backgroundTaskId?: string; isDenied: boolean; isError: boolean; isReadOnly?: boolean; isUnsandboxed?: boolean; text: string; stderr: string }
+export type BashOutcome = { backgroundTaskId?: string; isDenied: boolean; isError: boolean; isUnsandboxed?: boolean; text: string; stderr: string }
 
 const SCAN_LIMIT = 200_000
 // No host, path, or reason that the sandbox reports is longer than the longest path a file system takes, or holds a
@@ -43,7 +43,8 @@ const MAC_WRITE = /^\S+\(\d+\) deny\(\d+\) file-write-[a-z-]+\s+(\/.*)$/
 const LINUX_WRITE = /^deny [a-z0-9_]+ (\/.*)$/
 // The start of every report line: `deny ` for a network line and on Linux, `<program>(<pid>) ` on macOS.
 const REPORT_START = /^(?:deny |\S+\(\d+\) )/
-const EXIT_CODE = /^Exit code \d+/
+// The start of the error text of a command that ran and ended with an exit code that is not 0.
+export const EXIT_CODE = /^Exit code \d+/
 const PERMISSION_ERROR = /operation not permitted|read-only file system/i
 // An error of mkdir, BSD or GNU: the path that it names is the folder that it tried to create.
 const MKDIR_ERROR = /^mkdir: /
@@ -199,11 +200,12 @@ export function readCall(call: BashCall, outcome: BashOutcome, home: string | un
     return { reports: [], gated: outcome.isError ? [] : listed.filter(fits).map(sighting => ({ gate: 'sandbox-on', sighting })), unknownLine: null }
   }
   const isUnsandboxed = outcome.isUnsandboxed ?? call.isUnsandboxed
-  // Without a reported override, strict sandbox mode can have ignored the requested override.
-  const canInfer = ran && !outcome.isReadOnly && outcome.isUnsandboxed !== true && !lines.some(isFileLine)
+  // Without a reported override, strict sandbox mode can have ignored the requested override. A program that only
+  // reads names in its errors a place that it read, so neither such a command nor such a line gives a guess.
+  const canInfer = ran && !isReadOnlyCommand(call.command) && outcome.isUnsandboxed !== true && !lines.some(isFileLine)
   const inferred = canInfer
     ? capPaths(sources.flatMap(source => source.split('\n')).flatMap(line => {
-        const path = inferredPath(line, cwd)
+        const path = isReadOnlyLine(line) ? null : inferredPath(line, cwd)
         return path === null ? [] : [guessedSighting(path, line, home, program)]
       }))
     : []

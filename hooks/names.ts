@@ -34,6 +34,39 @@ const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
 const PLAIN_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=[^'"`$(){}\\]*$/
 // A file name: at most 255 characters, the most a file system takes.
 const PROGRAM_NAME = /^[\w.+-]{1,255}$/
+// Programs that only read: a permission error of one names a place that it read, never a folder that it wrote.
+const READ_ONLY_PROGRAMS: ReadonlySet<string> = new Set(['ls', 'cat', 'head', 'tail', 'grep', 'rg', 'find', 'stat', 'file', 'wc', 'du', 'df', 'tree'])
+// The operators that join the commands of one command line.
+const COMMAND_SEPARATOR = /&&|\|\||[;|&\n]/g
+// The characters outside quotes after which a word starts: a blank or an operator. A `#` there starts a comment. A
+// parenthesis is not one of them: it is a form that the scanner does not read (UNCERTAIN_FORMS).
+const WORD_BREAK: ReadonlySet<string> = new Set([' ', '\t', '\n', ';', '&', '|', '<', '>'])
+// Where the scanner reads a character: outside quotes, in double quotes, or in a command substitution outside quotes.
+type Place = 'bare' | 'double' | 'substitution'
+// The forms that the scanner cannot read with certainty, each with the places where it starts. A command line that
+// holds one is not read-only (isReadOnlyCommand), so Sandbox Tuner guesses from it as from any other command. Outside
+// single quotes and comments, each form is tested where it can start.
+const UNCERTAIN_FORMS: readonly { form: RegExp; places: readonly Place[] }[] = [
+  // A backslash-newline: the shell joins the two lines, so a `#` after it can start a comment.
+  { form: /\\\n/y, places: ['bare', 'double', 'substitution'] },
+  // A here-document, `<<` but not `<<<`: its lines are text, not commands.
+  { form: /(?<!<)<<(?!<)/y, places: ['bare', 'substitution'] },
+  // An ANSI-C quote, `$'...'`: a backslash in it keeps a `'` in the quote.
+  { form: /\$'/y, places: ['bare', 'substitution'] },
+  // A parenthesis outside `$(...)`: a subshell, a function, an array, an extended glob, a process substitution (`<(`,
+  // `>(`, or zsh's `=(`), or a zsh glob flag or qualifier. A process substitution, or a qualifier such as
+  // `*(e:'cmd':)`, runs a command.
+  { form: /[()]/y, places: ['bare'] },
+  // A `${...}` that does not end, or whose text before the first `}` holds a quote, a backslash, a backtick, a brace, a
+  // parenthesis, or a newline. bash ends `${x:-{a} b}` at the first `}`, zsh at the second, and zsh reads the `(e)` of
+  // `${(e)x}` as a flag that runs the value. Any other `${...}` ends at its first `}`, and the scanner reads it as one word.
+  { form: /\$\{(?![^'"`\\{}()\n]*\})/y, places: ['bare', 'double', 'substitution'] },
+  // A `#` at the start of a word in a command substitution: the comment that it starts can hold the `)` that seems to
+  // end the substitution, or a quote.
+  { form: /(?<=[\s;&|<>()`])#/y, places: ['substitution'] },
+]
+// The start of an error line that a program printed: its name, or its path, then a colon.
+const ERROR_PROGRAM = /^(\S+?): /
 // Protected names that hold in any folder: settings or code in them can run outside the sandbox.
 export const CLAUDE_PROTECTED: ReadonlySet<string> = new Set(['settings.json', 'settings.local.json', 'skills', 'agents', 'commands', 'hooks', 'workflows', 'scheduled_tasks.json'])
 const GIT_PROTECTED: ReadonlySet<string> = new Set(['hooks', 'config'])
@@ -232,4 +265,186 @@ export function programName(command: string): string {
   const [word = ''] = words.slice(index, index + 1)
   const program = word.slice(word.lastIndexOf('/') + 1)
   return PROGRAM_NAME.test(program) ? program : ''
+}
+
+/** Whether a form that the scanner cannot read with certainty (UNCERTAIN_FORMS) starts at `index`, in `place`. */
+function isUncertainAt(command: string, index: number, place: Place): boolean {
+  return UNCERTAIN_FORMS.some(({ form, places }) => {
+    form.lastIndex = index
+    return places.includes(place) && form.test(command)
+  })
+}
+
+/**
+ * The index just past the end of the command substitution whose backtick or `(` of `$(` is at `start`, -1 when it does
+ * not end, or null when a form that the scanner cannot read with certainty (UNCERTAIN_FORMS) starts before its end. A
+ * `$(` ends at the `)` that matches it outside quotes, and a backtick at the next backtick. A backslash keeps the next
+ * character from ending it, and so does a `${...}`.
+ */
+function substitutionEnd(command: string, start: number): number | null {
+  const isBacktick = command.charAt(start) === '`'
+  // The `(` at `start` is open.
+  let depth = 1
+  let quote = ''
+  for (let index = start + 1; index < command.length; index += 1) {
+    const char = command.charAt(index)
+    if (quote === "'") {
+      if (char === "'") quote = ''
+      continue
+    }
+    if (isUncertainAt(command, index, quote === '"' ? 'double' : 'substitution')) return null
+    // A `${...}` that is not uncertain ends at its first `}`.
+    if (char === '$' && command.charAt(index + 1) === '{') index = command.indexOf('}', index)
+    else if (char === '\\') index += 1
+    else if (isBacktick) {
+      if (char === '`') return index + 1
+    } else if (quote === '"') {
+      if (char === '"') quote = ''
+    } else if (char === "'" || char === '"') quote = char
+    else if (char === '(') depth += 1
+    else if (char === ')') {
+      depth -= 1
+      if (depth === 0) return index + 1
+    }
+  }
+  return -1
+}
+
+// What does not end before the end of a part of a command line: a quote, a command substitution, or nothing ('').
+type Open = '' | 'quote' | 'substitution'
+// A part of a command line as wordsHidden shows it, the start and the end of each comment in it, and what does not end.
+type HiddenPart = { shown: string; comments: [number, number][]; open: Open }
+
+/**
+ * The text of `command` from `from` to `to` as wordsHidden shows it in `shown`, or null when a form that the scanner
+ * cannot read with certainty (UNCERTAIN_FORMS) starts in it. Outside quotes, a character is in `place`: `bare` on the
+ * command line, `substitution` in the text of a command substitution. From a substitution that does not end before
+ * `to`, the text stays as it is.
+ */
+function hiddenPart(command: string, from: number, to: number, place: 'bare' | 'substitution'): HiddenPart | null {
+  let shown = ''
+  const comments: [number, number][] = []
+  let quote = ''
+  // Whether the next character starts a word.
+  let wordStart = true
+  for (let index = from; index < to; index += 1) {
+    const char = command.charAt(index)
+    if (quote === "'") {
+      if (char === "'") quote = ''
+      shown += char === "'" ? char : ' '
+      continue
+    }
+    if (isUncertainAt(command, index, quote === '"' ? 'double' : place)) return null
+    if (char === '`' || (char === '$' && command.charAt(index + 1) === '(')) {
+      const end = substitutionEnd(command, char === '$' ? index + 1 : index)
+      if (end === null) return null
+      if (end < 0 || end > to) return { shown: shown + command.slice(index, to), comments, open: 'substitution' }
+      const text = substitutionShown(command, index, end)
+      if (text === null) return null
+      shown += text
+      index = end - 1
+      wordStart = false
+      continue
+    }
+    if (char === '$' && command.charAt(index + 1) === '{') {
+      // A `${...}` that is not uncertain ends at its first `}`.
+      const end = command.indexOf('}', index) + 1
+      shown += ' '.repeat(end - index)
+      index = end - 1
+      wordStart = false
+      continue
+    }
+    if (char === '\\') {
+      shown += index + 1 < to ? '\\ ' : '\\'
+      index += 1
+      wordStart = false
+      continue
+    }
+    if (quote === '"') {
+      if (char === '"') quote = ''
+      shown += char === '"' ? char : ' '
+      continue
+    }
+    // In a substitution, a `#` at the start of a word is uncertain (UNCERTAIN_FORMS): only the command line has comments.
+    if (char === '#' && wordStart) {
+      // The comment ends before the newline, which the next step reads as an operator.
+      const newline = command.indexOf('\n', index)
+      const end = newline < 0 || newline > to ? to : newline
+      shown += ' '.repeat(end - index)
+      comments.push([index, end])
+      index = end - 1
+      continue
+    }
+    if (char === "'" || char === '"') quote = char
+    shown += char
+    wordStart = WORD_BREAK.has(char)
+  }
+  return { shown, comments, open: quote === '' ? '' : 'quote' }
+}
+
+/**
+ * The command substitution from its `$` or backtick at `start` to `end` as wordsHidden shows it, or null when a form
+ * that the scanner cannot read with certainty (UNCERTAIN_FORMS) starts in it. The shell runs its text as a command with
+ * its own quotes, so the rules of the command line show that text, with `substitution` as the place outside quotes. The
+ * substitution stays as it is when a quote or a substitution in its text does not end there. A backtick pair that holds
+ * a backslash stays as it is too: there the shell takes a backslash away before a `$`, a backtick, or a backslash, then
+ * reads the command, so a quote can differ from the quote that it seems.
+ */
+function substitutionShown(command: string, start: number, end: number): string | null {
+  const text = command.slice(start, end)
+  const isBacktick = text.startsWith('`')
+  if (isBacktick && text.includes('\\')) return text
+  const from = start + (isBacktick ? 1 : 2)
+  const part = hiddenPart(command, from, end - 1, 'substitution')
+  if (part === null) return null
+  return part.open === '' ? command.slice(start, from) + part.shown + command.slice(end - 1, end) : text
+}
+
+/**
+ * A command line as the shell reads it, in two forms of its length. In `shown`, each character that a quote or a
+ * backslash makes part of a word, and each character of a comment, is replaced by a space: a `|`, `;`, `&`, newline, or
+ * `>` there joins no command and sends nothing into a file. In `bare`, only each character of a comment is replaced.
+ * Outside quotes, a `#` at the start of a word (WORD_BREAK) starts a comment that ends at the end of the line: a quote,
+ * a backslash, or a substitution in it is part of the comment. Inside double quotes, a backslash keeps the next
+ * character in the quote. The text of a command substitution, `$(...)` or a backtick pair outside single quotes, is a
+ * command that the shell runs, with its own quotes: the same rules show it (substitutionShown), so an operator outside
+ * its quotes counts, and one inside them does not. After it, the quote before it goes on. A `${...}` outside single
+ * quotes is part of one word up to its first `}`: nothing in it starts a comment or breaks the word, so it is replaced
+ * in `shown`. From a substitution that does not end, and in a line whose quote does not close, the text stays as it is.
+ * A line that holds a form that the scanner cannot read with certainty (UNCERTAIN_FORMS) gives null.
+ */
+function wordsHidden(command: string): { shown: string; bare: string } | null {
+  const part = hiddenPart(command, 0, command.length, 'bare')
+  if (part === null) return null
+  if (part.open === 'quote') return { shown: command, bare: command }
+  const bare = part.comments.reduce((text, [start, end]) => text.slice(0, start) + ' '.repeat(end - start) + text.slice(end), command)
+  return { shown: part.shown, bare }
+}
+
+/**
+ * Whether every program of a command line only reads (READ_ONLY_PROGRAMS), and the line sends no output into a file.
+ * Only an operator outside quotes and comments splits the line (wordsHidden). A part that holds only a comment, or a
+ * `cd`, changes nothing. A command whose program name is not sure counts as one that can write, and so does a line that
+ * holds a form that the scanner cannot read with certainty (UNCERTAIN_FORMS).
+ */
+export function isReadOnlyCommand(command: string): boolean {
+  const hidden = wordsHidden(command)
+  if (hidden === null) return false
+  const { shown, bare } = hidden
+  if (shown.includes('>')) return false
+  const parts: string[] = []
+  let start = 0
+  for (const separator of shown.matchAll(COMMAND_SEPARATOR)) {
+    parts.push(bare.slice(start, separator.index))
+    start = separator.index + separator[0].length
+  }
+  parts.push(bare.slice(start))
+  const programs = parts.filter(part => part.trim() !== '').map(programName).filter(program => program !== 'cd')
+  return programs.length > 0 && programs.every(program => READ_ONLY_PROGRAMS.has(program))
+}
+
+/** Whether an error line starts with the name or the path of a program that only reads, as `ls: /path: ...` does. */
+export function isReadOnlyLine(line: string): boolean {
+  const [, program = ''] = ERROR_PROGRAM.exec(line) ?? []
+  return READ_ONLY_PROGRAMS.has(program.slice(program.lastIndexOf('/') + 1))
 }
