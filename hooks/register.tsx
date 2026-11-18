@@ -1,13 +1,15 @@
 // Sandbox Tuner's hooks module: every hook and every $ call.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, HookFailure, Register, RenderElement, Timer, ToolCallResult } from 'claude-code'
+import type { EngineInterface, HookFailure, Register, RenderElement, Timer } from 'claude-code'
 
 import type { SandboxTunerAction, SandboxTunerApplied, SandboxTunerLatest, SandboxTunerLineage, SandboxTunerNotice, SandboxTunerRecord, SandboxTunerScope } from '../types'
 import { KeyFailure, causeOf, diagnostic, shownCause } from './diagnostics'
 import { TMP, absolutePath, commandLine, cutText, displayPath, isTempFolder, isUnder, pathFolders, plainText } from './names'
 import { JOURNAL_PREFIX, LINEAGE_PREFIX, REFUSAL_LIMIT, REFUSAL_PREFIX, WRITER_PREFIX, HIDDEN_PREFIX, aggregateRecords, appliedIn, hasLaterOwner, isLineage, isUndoUnresolved, isFixedSince, isPressedAgain, isRecord, journalOf, keptBranches, keysSeenBy, lineageStep, mergeSighting, newestRefusals, recordKey, seenIn, shownRecords } from './records'
 import type { Lineage } from './records'
+import { callOf, needsResult, storedResult, storedUse, toolResultsOf, toolUsesOf } from './rows'
+import type { ToolResult, ToolUse } from './rows'
 import { addEntry, fileInfo, isApplied, lockText, parseSettings, readLock, removeEntry, serializeSettings } from './settings-file'
 import type { FileInfo, ParsedSettings } from './settings-file'
 import { keepGated, latestOf, readCall, reportQuote } from './sightings'
@@ -19,8 +21,6 @@ import {
   COMMAND_DESCRIPTION, NOTHING_TO_CHANGE, NOTHING_TO_UNDO, SWITCHING, absentNotice, addedNotice, displayTarget, grantWarning, hiddenNotice, notAppliedText, notPlaced,
   nothingApplied, hostText, refusalText, removedNotice, shownNotice, verdictSentences, verificationRefusalText,
 } from './words'
-
-type BashInput = { command: string; run_in_background?: boolean; dangerouslyDisableSandbox?: boolean; allowed_domains?: string[] }
 
 const backgroundTasks = atom({ plugin: 'sandbox-tuner', key: 'backgroundTasks' } as const, [] as string[])
 const writerId = crypto.randomUUID()
@@ -312,22 +312,6 @@ async function homeOf($: EngineInterface): Promise<string | undefined> {
   return folderOf(await $.env.get('HOME'), '/')
 }
 
-function toCall(e: BashInput): BashCall {
-  return {
-    command: e.command,
-    isBackground: e.run_in_background === true,
-    isUnsandboxed: e.dangerouslyDisableSandbox === true,
-    allowedDomains: e.allowed_domains ?? [],
-  }
-}
-
-// The Bash matcher types the result: on the success arm `result` is Bash's record, which core validates.
-function toOutcome(out: ToolCallResult<'Bash'>): BashOutcome {
-  if (out.deny !== undefined) return { isDenied: true, isError: false, text: '', stderr: '' }
-  if (out.isError === true) return { isDenied: false, isError: true, isReadOnly: out.isReadOnly === true, text: out.text ?? '', stderr: '' }
-  return { isDenied: false, isError: false, isReadOnly: out.isReadOnly === true, backgroundTaskId: out.result.backgroundTaskId, isUnsandboxed: out.result.dangerouslyDisableSandbox, text: out.text ?? '', stderr: out.result.stderr }
-}
-
 /**
  * The session of a press or a tool call, read once when it starts: its id, or why Claude Code could not give it, and
  * whether a switch was in progress then (`isSwitching`, SwitchFailure).
@@ -347,9 +331,9 @@ async function sessionOrigin($: EngineInterface): Promise<Origin> {
 }
 
 /**
- * What a call starts in, read before it runs with scope session: its session, and its working directory, which
- * resolves a relative path in its output. Null when the working directory cannot be read: then the call reads it again
- * once it ends.
+ * What a call starts in, read at its request row with scope session: its session, and its working directory, which
+ * resolves a relative path in its output. With Code Mode off, Claude Code keeps the request row before the call runs.
+ * Null when the working directory cannot be read: then the call reads it again once it ends.
  */
 type CallStart = { origin: Origin; cwd: string | null }
 
@@ -367,19 +351,19 @@ async function gatedSightings($: EngineInterface, gated: readonly GatedSighting[
   try {
     return keepGated(gated, sandboxFacts(await $.settings.read()))
   } catch (error) {
-    await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
+    await noteCallFault($, isShown, diagnostic('session.append', tool, `could not read settings to check the sandbox: ${causeOf(error)}. Kept only sandbox reports, and none of a call that failed.`))
     return []
   }
 }
 
 /**
  * The session id that the sightings of a call name: with scope session, the session that ran the call (`origin`, read
- * before the call ran), and with scope all, read now (`origin` null), as in Sandbox Tuner 1.1.3.
+ * at its request row), and with scope all, read now (`origin` null), as in Sandbox Tuner 1.1.3.
  */
 async function sessionIdOf($: EngineInterface, tool: string, origin: Origin | null, isShown: boolean): Promise<string | null> {
   const found = origin ?? (await sessionOrigin($))
   if (found.session !== null) return found.session
-  await noteCallFault($, isShown, diagnostic('tool.call', tool, `could not read the session id: ${found.cause}`))
+  await noteCallFault($, isShown, diagnostic('session.append', tool, `could not read the session id: ${found.cause}`))
   return null
 }
 
@@ -404,7 +388,7 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
     // The session that ran the call refuses, also after an in-app /resume of it (startSession) and a reload (recordCall).
     if (sessionId !== null) remember(incomplete, sessionId, REFUSAL_LIMIT)
     await update($, evidenceIncomplete, () => true)
-    const problem = (cause: string) => diagnostic('tool.call', tool, `could not save the sighting of ${key}: ${cause}`)
+    const problem = (cause: string) => diagnostic('session.append', tool, `could not save the sighting of ${key}: ${cause}`)
     await noteCallFault($, isShown, problem(causeOf(error)), problem(shownCause(scope, error)))
     return false
   }
@@ -412,13 +396,12 @@ async function saveSighting($: EngineInterface, scope: SandboxTunerScope, sighti
 
 /**
  * Records the sandbox blocks of one call. With scope session, `start` holds the session that ran it and its working
- * directory, read before it ran. When /clear, /resume, or /branch started another session during the call, its
+ * directory, read at its request row. When /clear, /resume, or /branch started another session during the call, its
  * sightings name the session that ran it, and the session now shows nothing of it: its problems go to the debug log
  * only. A call whose session is unknown shows in no session, the same way. With scope all (`start` null), both are read
- * once the call ends, as in Sandbox Tuner 1.1.3.
+ * once the call is recorded, as in Sandbox Tuner 1.1.3.
  */
-async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: CallStart | null, call: BashCall, outcome: BashOutcome, signal: AbortSignal, tool = 'Bash'): Promise<void> {
-  if (signal.aborted) return
+async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: CallStart | null, call: BashCall, outcome: BashOutcome, tool: string): Promise<void> {
   const taskId = outcome.backgroundTaskId
   if (taskId !== undefined && (await read($, backgroundTasks)).includes(taskId)) return
   const origin = start?.origin ?? null
@@ -426,13 +409,13 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: C
   const isQuiet = reports.length === 0 && gated.length === 0 && unknownLine === null && observation === undefined
   const isShown = origin === null || isQuiet || (await isSessionNow($, scope, origin.session))
   // The debug log only: the pane would show a block that the command printed as a problem.
-  if (skipped) logDebug($, diagnostic('tool.call', tool, 'skipped a <sandbox_violations> block that does not end the text of a failed call (not quoted: the command can print one)'))
+  if (skipped) logDebug($, diagnostic('session.append', tool, 'skipped a <sandbox_violations> block that does not end the text of a failed call (not quoted: the command can print one)'))
   if (unknownLine !== null) {
     const quote = reportQuote(unknownLine)
     const cause = quote === null
       ? `skipped a sandbox report line of an unknown form (${unknownLine.length} characters, not quoted: it does not start like a report line)`
       : `skipped a sandbox report line of an unknown form: ${quote}`
-    await noteCallFault($, isShown, diagnostic('tool.call', tool, cause))
+    await noteCallFault($, isShown, diagnostic('session.append', tool, cause))
   }
   const sightings = gated.length === 0 ? reports : [...reports, ...(await gatedSightings($, gated, tool, isShown))]
   if (observation !== undefined && isShown) {
@@ -446,14 +429,209 @@ async function recordCall($: EngineInterface, scope: SandboxTunerScope, start: C
   await keepBranchKeys($, sessionId, now)
   let isLost = false
   for (const sighting of sightings) {
-    if (signal.aborted) break
     if (!(await saveSighting($, scope, sighting, sessionId, now, tool, isShown))) isLost = true
   }
   // Once for the call: the store that could not save a sighting can refuse this write too.
-  if (isLost && sessionId !== null) await saveRefusal($, sessionId, 'tool.call')
-  if (signal.aborted) return
+  if (isLost && sessionId !== null) await saveRefusal($, sessionId, 'session.append')
   const newest = latestOf(sightings, commandLine(call.command), now)
   if (newest !== null && isShown) await update($, latest, () => newest)
+}
+
+/**
+ * A Bash or Monitor call whose request row Sandbox Tuner saw and whose result row has not come: the call, the loop that
+ * runs it (`agentId`, absent for the main loop), the id of the request row (`anchor`, unknown when a read of the whole
+ * conversation found the call), and with scope session, its session and working directory, read at that row (`start`).
+ * With Code Mode off, Claude Code keeps the request row before the call runs. In Code Mode, both rows of a call inside a
+ * script come when the script settles.
+ */
+type Request = { use: ToolUse; agentId: string | undefined; anchor: string | undefined; start: CallStart | null }
+// The most calls that wait for their result row: the newest. The result row of an older one counts after a read of the
+// newest messages, as for a call whose request row Sandbox Tuner did not see (deliverUnseen).
+const REQUEST_LIMIT = 256
+// The calls that wait for their result row, by tool use id, the newest last. One per module instance, as the queue.
+const requests = new Map<string, Request>()
+// How many tool use ids of calls whose result row came `delivered` keeps: the newest.
+const DELIVERED_LIMIT = 2000
+// The tool use ids of the calls whose result row came, the newest last: rows of a call that come again count once.
+const delivered = new Set<string>()
+
+function keepRequest(request: Request): void {
+  if (delivered.has(request.use.id)) return
+  requests.delete(request.use.id)
+  requests.set(request.use.id, request)
+  for (const oldest of requests.keys()) {
+    if (requests.size <= REQUEST_LIMIT) break
+    requests.delete(oldest)
+  }
+}
+
+// When Sandbox Tuner reads the record that the transcript stored for a call, in milliseconds after its result row. Claude
+// Code stores the record of a call of the main loop about 50 ms after the row, and of an agent's call with the row. After
+// the last read, the call has no record: a call inside a Code Mode script stores none.
+const READ_STEPS = [0, 50, 100, 250, 1000, 3000] as const
+// How many of the newest messages a read takes when the request row to read on from is gone or unknown, and for the
+// input of a call whose request row Sandbox Tuner did not see.
+const READ_LAST = 8
+
+/** A call that waits for its stored record: its tool use id, its request row, the time of its result row, and its next read. */
+type Waiting = { id: string; anchor: string | undefined; at: number; step: number; done: (stored: Record<string, unknown> | undefined) => void }
+/** The calls of one conversation that wait for their stored record, and the timer of their next read: one read serves them all. */
+type Conversation = { agentId: string | undefined; waiting: Waiting[]; isReading: boolean; timer: Timer | null }
+// The conversations whose calls wait for a stored record, by agent id, '' for the main loop. One per module instance.
+const conversations = new Map<string, Conversation>()
+// The read that this Claude Code version takes: the messages `after` a row, the `last` ones, or the whole conversation.
+let readForm: 'after' | 'last' | 'whole' = 'after'
+// How many reads in a row must find a range refused, while a wider read answers, before Sandbox Tuner stops asking for
+// that range. One refusal can be a passing failure.
+const RANGE_REFUSALS = 3
+// How many reads in a row found each range refused while a wider read answered. An answer of the range resets it.
+const rangeRefusals = { after: 0, last: 0 }
+// Whether the debug log said that a read failed. It says so once for each module instance.
+let isReadFailureLogged = false
+
+/**
+ * The messages of a conversation (`agentId`, absent for the main loop) after the request row `anchor`. When that row is
+ * gone, such as after a compaction, or unknown, the newest READ_LAST messages. A range that throws while a wider read
+ * answers counts as refused: after RANGE_REFUSALS such reads in a row, Sandbox Tuner reads with the wider form from
+ * then on. A read that fails in every form changes no form. Null when the conversation cannot be read. It never rejects.
+ */
+async function readMessages($: EngineInterface, agentId: string | undefined, anchor: string | undefined): Promise<readonly unknown[] | null> {
+  // The ranges that threw in this read. They count as refused only when a wider read answers.
+  const threw: ('after' | 'last')[] = []
+  const answered = (found: unknown): readonly unknown[] | null => {
+    if (!Array.isArray(found)) return null
+    for (const form of threw) {
+      rangeRefusals[form] += 1
+      if (rangeRefusals[form] < RANGE_REFUSALS) continue
+      if (form === 'last') readForm = 'whole'
+      else if (readForm === 'after') readForm = 'last'
+    }
+    return found
+  }
+  try {
+    if (readForm === 'after' && anchor !== undefined) {
+      // A typed value, not an object literal: the declarations of older Claude Code versions name no range.
+      const range: { agentId?: string; after?: string } = agentId === undefined ? { after: anchor } : { agentId, after: anchor }
+      try {
+        const found = await $.session.messages(range)
+        rangeRefusals.after = 0
+        if (Array.isArray(found)) return found
+      } catch {
+        threw.push('after')
+      }
+    }
+    if (readForm !== 'whole') {
+      const range: { agentId?: string; last?: number } = agentId === undefined ? { last: READ_LAST } : { agentId, last: READ_LAST }
+      try {
+        const found = await $.session.messages(range)
+        rangeRefusals.last = 0
+        return answered(found)
+      } catch {
+        threw.push('last')
+      }
+    }
+    return answered(agentId === undefined ? await $.session.messages() : await $.session.messages({ agentId }))
+  } catch (error) {
+    if (!isReadFailureLogged) {
+      isReadFailureLogged = true
+      logDebug($, diagnostic('session.append', null, `could not read the results that the transcript stored: ${causeOf(error)}. Sandbox Tuner reads each call from its result row only.`))
+    }
+    return null
+  }
+}
+
+/**
+ * Reads once for the calls of a conversation whose read is due (READ_STEPS), hands each call that the read found its
+ * record, and each call past its last read none. Then it waits for the next read that is due. One read runs at a time:
+ * a call that comes during it waits for the next pass. It never rejects.
+ */
+async function readDue($: EngineInterface, key: string, conversation: Conversation): Promise<void> {
+  if (conversation.isReading) return
+  conversation.isReading = true
+  conversation.timer?.cancel()
+  conversation.timer = null
+  const dueAt = (entry: Waiting) => entry.at + (READ_STEPS[entry.step] ?? 0)
+  try {
+    for (;;) {
+      const now = await $.clock.now()
+      const due = conversation.waiting.filter(entry => dueAt(entry) <= now)
+      const [first] = due
+      if (first === undefined) {
+        // In the same turn of the event loop as the check above: no call can come between them.
+        const next = Math.min(...conversation.waiting.map(dueAt))
+        if (Number.isFinite(next)) conversation.timer = $.clock.after(next - now, () => void readDue($, key, conversation))
+        else if (conversations.get(key) === conversation) conversations.delete(key)
+        return
+      }
+      // The messages after the request row of the oldest call that is due hold the results of the later calls too.
+      const messages = await readMessages($, conversation.agentId, first.anchor)
+      for (const entry of [...conversation.waiting]) {
+        const stored = messages === null ? undefined : storedResult(messages, entry.id)
+        if (stored === undefined && due.includes(entry)) entry.step += 1
+        if (stored === undefined && entry.step < READ_STEPS.length) continue
+        conversation.waiting.splice(conversation.waiting.indexOf(entry), 1)
+        entry.done(stored)
+      }
+    }
+  } catch {
+    // The clock could not be read: every call that waits goes on without a record.
+    for (const entry of conversation.waiting.splice(0)) entry.done(undefined)
+    if (conversations.get(key) === conversation) conversations.delete(key)
+  } finally {
+    conversation.isReading = false
+  }
+}
+
+/**
+ * The record that the transcript stored for the call of `request`, or undefined after the last read. `at` is the time of
+ * its result row, and `step` its first read that is still to come. Rejects when the clock cannot be read.
+ */
+async function awaitStored($: EngineInterface, request: Request, at: number, step: number): Promise<Record<string, unknown> | undefined> {
+  const key = request.agentId ?? ''
+  const conversation = conversations.get(key) ?? { agentId: request.agentId, waiting: [], isReading: false, timer: null }
+  conversations.set(key, conversation)
+  return new Promise(done => {
+    conversation.waiting.push({ id: request.use.id, anchor: request.anchor, at, step, done })
+    void readDue($, key, conversation)
+  })
+}
+
+/**
+ * Records one Bash or Monitor call from its result row: at once when the row text tells all that Sandbox Tuner needs,
+ * else with the record that the transcript stored, or after the last read with the row text only. `found` is what the
+ * read at the result row found of a call whose request row Sandbox Tuner did not see: then that read was the first.
+ * It never rejects: a problem goes to the debug log.
+ */
+async function deliver($: EngineInterface, scope: SandboxTunerScope, request: Request, result: ToolResult, found?: { at: number; stored: Record<string, unknown> | undefined }): Promise<void> {
+  const { use } = request
+  try {
+    const stored = !needsResult(use, result) ? undefined : (found?.stored ?? (await awaitStored($, request, found?.at ?? (await $.clock.now()), found === undefined ? 0 : 1)))
+    await settleSwitch($)
+    const parts = callOf(use, result, stored)
+    if (parts !== null) await enqueue(() => recordCall($, scope, request.start, parts.call, parts.outcome, use.tool))
+  } catch (error) {
+    logDebug($, diagnostic('session.append', use.tool, `hook failed (throw): ${causeOf(error)}`))
+  }
+}
+
+/**
+ * Records a Bash or Monitor call whose result row came but whose request row Sandbox Tuner did not see, as when it
+ * loaded or reloaded while the call ran, or when more than REQUEST_LIMIT calls waited: one read of the newest messages
+ * of its conversation gives its input. With scope session, its session and working directory are read at the result
+ * row. A call that the read does not find counts nothing. It never rejects: a problem goes to the debug log.
+ */
+async function deliverUnseen($: EngineInterface, scope: SandboxTunerScope, agentId: string | undefined, result: ToolResult, tool: string): Promise<void> {
+  try {
+    const at = await $.clock.now()
+    const messages = await readMessages($, agentId, undefined)
+    const found = messages === null ? undefined : storedUse(messages, result.id)
+    if (found === undefined || messages === null) return
+    await settleSwitch($)
+    const start = scope === 'session' ? await callStart($) : null
+    await deliver($, scope, { use: found.use, agentId, anchor: found.anchor, start }, result, { at, stored: storedResult(messages, result.id) })
+  } catch (error) {
+    logDebug($, diagnostic('session.append', tool, `hook failed (throw): ${causeOf(error)}`))
+  }
 }
 
 /** Every writer's saved record, of `targetKey` only when given. A record that is not valid fails the read. */
@@ -1900,31 +2078,35 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    await settleSwitch($)
-    // With scope session, the session and the working directory of the call, read before it runs: /clear, /resume, or
-    // /branch can start another session while it runs.
-    const start = scope === 'session' ? await callStart($) : null
-    const out = await next(e)
-    // The wait for the queue counts as this hook's own time, so the job stops once the dispatch is abandoned.
-    if (!next.signal.aborted) await enqueue(() => recordCall($, scope, start, toCall(e), toOutcome(out), next.signal))
-    return out
-  }).catch(($, e, next) => {
-    hookFailed($, 'tool.call', 'Bash', next.error)
-    return next(e)
-  })
-
-  on('tool.call', { tool: 'Monitor' }, async ($, e, next) => {
-    await settleSwitch($)
-    const start = scope === 'session' ? await callStart($) : null
-    const out = await next(e)
-    if (!next.signal.aborted && e.command !== undefined && e.ws === undefined && out.deny === undefined && out.isError !== true && out.result.taskId !== '') {
-      await enqueue(() => recordCall($, scope, start, { command: e.command!, isBackground: true, isUnsandboxed: false, allowedDomains: e.allowed_domains ?? [] },
-        { isDenied: false, isError: false, backgroundTaskId: out.result.taskId, text: '', stderr: '' }, next.signal, 'Monitor'))
+  // Each Bash call and shell Monitor launch, from two rows of the conversation: the request row of the call, with its
+  // input, and its result row. The hook changes no row, and it waits for no record: Claude Code has the result first.
+  on('session.append', { door: ['response', 'tool-result'] }, async ($, e, next) => {
+    const content: readonly unknown[] = Array.isArray(e.message.content) ? e.message.content : []
+    if (e.door === 'response') {
+      const uses = toolUsesOf(content)
+      if (uses.length === 0) return next(e)
+      await settleSwitch($)
+      // With scope session, the session and the working directory of the call: /clear, /resume, or /branch can start
+      // another session while it runs.
+      const start = scope === 'session' ? await callStart($) : null
+      for (const use of uses) keepRequest({ use, agentId: e.agentId, anchor: e.uuid, start })
+      return next(e)
     }
-    return out
+    // A row of a Bash or Monitor call whose request row Sandbox Tuner did not see still counts, after a read.
+    const tool = e.origin.kind === 'tool' && (e.origin.tool === 'Bash' || e.origin.tool === 'Monitor') ? e.origin.tool : null
+    const results = toolResultsOf(content).flatMap(result => {
+      if (delivered.has(result.id)) return []
+      const request = requests.get(result.id)
+      if (request === undefined && tool === null) return []
+      requests.delete(result.id)
+      remember(delivered, result.id, DELIVERED_LIMIT)
+      return [{ request, result }]
+    })
+    const stored = await next(e)
+    for (const { request, result } of results) void (request === undefined ? deliverUnseen($, scope, e.agentId, result, tool ?? 'Bash') : deliver($, scope, request, result))
+    return stored
   }).catch(($, e, next) => {
-    hookFailed($, 'tool.call', 'Monitor', next.error)
+    hookFailed($, 'session.append', null, next.error)
     return next(e)
   })
 
